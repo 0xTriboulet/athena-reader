@@ -1,0 +1,1055 @@
+//! Athena Reader GUI application.
+//!
+//! This binary provides an egui/eframe UI that can:
+//! - Paste an image from the clipboard and run OCR
+//! - Import images or PDFs (PDFs use embedded-text extraction)
+//! - Preview and edit extracted text
+//! - Stream words/chunks at a target WPM using an ORP-style centered display
+
+use std::env;
+use std::io::Cursor;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use arboard::Clipboard;
+use athena_core::ocr::{
+    DEFAULT_DETECTION_FILENAME, DEFAULT_DETECTION_URL, DEFAULT_DICT_FILENAME, DEFAULT_DICT_URL,
+    DEFAULT_RECOGNITION_FILENAME, DEFAULT_RECOGNITION_URL, OarOcrEngine, OcrEngine, OcrInput,
+    OcrModelDownloadConfig, OcrModelDownloadInfo, OcrModelPaths, OcrResult, ensure_models,
+};
+use athena_core::reader::{ReadingSession, interval_ms};
+use athena_core::settings::{Theme, UserSettings, load_settings, save_settings};
+use athena_core::text;
+use directories::ProjectDirs;
+use eframe::egui;
+use image::{DynamicImage, ImageBuffer, Rgba};
+
+const ENV_OCR_DETECTION_MODEL: &str = "ATHENA_OCR_DETECTION_MODEL";
+const ENV_OCR_RECOGNITION_MODEL: &str = "ATHENA_OCR_RECOGNITION_MODEL";
+const ENV_OCR_DICT_PATH: &str = "ATHENA_OCR_DICT_PATH";
+const ENV_OCR_DETECTION_URL: &str = "ATHENA_OCR_DETECTION_URL";
+const ENV_OCR_RECOGNITION_URL: &str = "ATHENA_OCR_RECOGNITION_URL";
+const ENV_OCR_DICT_URL: &str = "ATHENA_OCR_DICT_URL";
+const ENV_OCR_DETECTION_SHA256: &str = "ATHENA_OCR_DETECTION_SHA256";
+const ENV_OCR_RECOGNITION_SHA256: &str = "ATHENA_OCR_RECOGNITION_SHA256";
+const ENV_OCR_DICT_SHA256: &str = "ATHENA_OCR_DICT_SHA256";
+const ENV_OCR_CACHE_DIR: &str = "ATHENA_OCR_MODEL_CACHE_DIR";
+const ENV_OCR_DISABLE_DOWNLOAD: &str = "ATHENA_OCR_DISABLE_DOWNLOAD";
+
+/// Maximum number of words shown in the Preview panel.
+const OCR_PREVIEW_WORD_LIMIT: usize = 25;
+
+/// High-level UI state used to enable/disable controls and show status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiState {
+    /// Waiting for user input (no active session).
+    Idle,
+    /// Background processing (OCR or PDF text extraction) is running.
+    Processing,
+    /// Extracted text is available for preview/editing.
+    Preview,
+    /// Reading session exists (playing or paused).
+    Reading,
+    /// An unrecoverable error occurred (until next successful import/paste).
+    Error,
+}
+
+impl UiState {}
+
+/// Background result from OCR or PDF text extraction.
+enum OcrResponse {
+    /// Text successfully extracted.
+    Success(String),
+    /// A user-visible error message.
+    Error(String),
+}
+
+/// Background result from the Import file picker.
+enum ImportResponse {
+    /// User canceled the dialog.
+    Canceled,
+    /// File selected; `bytes` contains file contents and `is_pdf` controls processing path.
+    Selected {
+        bytes: Vec<u8>,
+        is_pdf: bool,
+        is_txt: bool,
+    },
+}
+
+/// Captures user intent from the editor UI.
+#[derive(Debug, Default, Clone, Copy)]
+struct EditorAction {
+    /// Save the draft back to the main app state.
+    save: bool,
+    /// Close without saving.
+    cancel: bool,
+}
+
+/// Top-level egui application state for Athena Reader.
+struct AthenaApp {
+    ui_state: UiState,
+    status: String,
+    ocr_text: String,
+    ocr_editor_open: bool,
+    ocr_editor_draft: String,
+    session: Option<ReadingSession>,
+    model_paths: Option<OcrModelPaths>,
+    model_download: OcrModelDownloadConfig,
+    settings: UserSettings,
+    settings_path: Option<PathBuf>,
+    next_tick: Option<Instant>,
+    ocr_rx: Option<mpsc::Receiver<OcrResponse>>,
+    ocr_started_at: Option<Instant>,
+    import_rx: Option<mpsc::Receiver<ImportResponse>>,
+}
+
+impl AthenaApp {
+    /// Creates the application state, loads persisted settings, and configures egui visuals.
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Ensure child viewports open as separate OS windows when supported by the backend.
+        cc.egui_ctx.set_embed_viewports(false);
+
+        let settings_path = settings_path();
+        let settings = settings_path
+            .as_ref()
+            .and_then(|path| load_settings(path).ok())
+            .unwrap_or_default();
+        apply_theme(&cc.egui_ctx, &settings.theme);
+
+        Self {
+            ui_state: UiState::Idle,
+            status: "Paste an image to run OCR.".to_string(),
+            ocr_text: String::new(),
+            ocr_editor_open: false,
+            ocr_editor_draft: String::new(),
+            session: None,
+            model_paths: default_model_paths(),
+            model_download: model_download_config(),
+            settings,
+            settings_path,
+            next_tick: None,
+            ocr_rx: None,
+            ocr_started_at: None,
+            import_rx: None,
+        }
+    }
+
+    fn persist_settings(&mut self) {
+        if let Some(path) = self.settings_path.as_ref()
+            && let Err(error) = save_settings(path, &self.settings)
+        {
+            self.set_status(format!("Failed to save settings: {error}"));
+        }
+    }
+
+    /// Updates the status string shown in the bottom-right overlay.
+    fn set_status(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+    }
+
+    /// Updates both the UI state and the status string.
+    fn set_state(&mut self, state: UiState, message: impl Into<String>) {
+        self.ui_state = state;
+        self.status = message.into();
+    }
+
+    /// Transitions to the error state and updates the status string.
+    fn set_error(&mut self, message: impl Into<String>) {
+        self.ui_state = UiState::Error;
+        self.status = message.into();
+    }
+
+    /// Spawns an OCR worker thread to keep the UI responsive.
+    fn spawn_ocr(&mut self, bytes: Vec<u8>) {
+        if self.ui_state == UiState::Processing {
+            self.set_status("Processing already running.");
+            return;
+        }
+
+        let Some(paths) = self.model_paths.as_ref() else {
+            self.set_error(
+        "OCR model paths not configured. Set ATHENA_OCR_DETECTION_MODEL, ATHENA_OCR_RECOGNITION_MODEL, ATHENA_OCR_DICT_PATH, or ATHENA_OCR_MODEL_CACHE_DIR.",
+      );
+            return;
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let paths = OcrModelPaths::new(
+            paths.detection.clone(),
+            paths.recognition.clone(),
+            paths.dict.clone(),
+        );
+        let download_config = self.model_download.clone();
+        let missing_models =
+            !paths.detection.exists() || !paths.recognition.exists() || !paths.dict.exists();
+        if missing_models && !download_config.allow_download {
+            self.set_error(
+        "OCR models missing and downloads are disabled. Set ATHENA_OCR_DETECTION_MODEL, ATHENA_OCR_RECOGNITION_MODEL, ATHENA_OCR_DICT_PATH, or unset ATHENA_OCR_DISABLE_DOWNLOAD.",
+      );
+            return;
+        }
+        self.ocr_rx = Some(rx);
+        self.ocr_started_at = Some(Instant::now());
+        let status = if missing_models {
+            "Downloading OCR models..."
+        } else {
+            "Running OCR..."
+        };
+        self.set_state(UiState::Processing, status);
+
+        thread::spawn(move || {
+            let result = ensure_models(&paths, &download_config)
+                .and_then(|_| OarOcrEngine::from_paths(&paths))
+                .and_then(|mut engine| engine.extract_text(&OcrInput::Bytes(bytes)));
+            let message = match result {
+                Ok(OcrResult { text, .. }) => OcrResponse::Success(text),
+                Err(error) => OcrResponse::Error(error.to_string()),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    /// Polls the OCR/PDF worker channel and applies results to the UI state.
+    fn poll_ocr(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.ocr_rx.as_ref() else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(message) => {
+                self.ocr_rx = None;
+                self.ocr_started_at = None;
+                match message {
+                    OcrResponse::Success(text) => {
+                        self.ocr_text = text.trim().to_string();
+                        if self.ocr_text.is_empty() {
+                            self.set_error("No text detected. Try another file.");
+                        } else {
+                            self.set_state(UiState::Preview, "Text ready.");
+                            self.start_session();
+                        }
+                    }
+                    OcrResponse::Error(error) => {
+                        self.set_error(format!("Processing failed: {error}"))
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                if self.ui_state == UiState::Processing {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.ocr_rx = None;
+                self.ocr_started_at = None;
+                self.set_error("OCR worker disconnected.");
+            }
+        }
+    }
+
+    /// Returns a human-friendly processing timer string for the status overlay.
+    fn ocr_progress(&self) -> Option<String> {
+        if self.ui_state != UiState::Processing {
+            return None;
+        }
+        self.ocr_started_at.map(|start| {
+            let elapsed = start.elapsed().as_secs_f32();
+            format!("Processing ({elapsed:.1}s)")
+        })
+    }
+
+    /// Reads an image from the clipboard and starts OCR.
+    fn paste_image_from_clipboard(&mut self) {
+        let mut clipboard = match Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(error) => {
+                self.set_error(format!("Clipboard error: {error}"));
+                return;
+            }
+        };
+
+        let image = match clipboard.get_image() {
+            Ok(image) => image,
+            Err(error) => {
+                self.set_error(format!("No image in clipboard: {error}"));
+                return;
+            }
+        };
+
+        let buffer = match ImageBuffer::<Rgba<u8>, _>::from_raw(
+            image.width as u32,
+            image.height as u32,
+            image.bytes.into_owned(),
+        ) {
+            Some(buffer) => buffer,
+            None => {
+                self.set_error("Clipboard image buffer was invalid.");
+                return;
+            }
+        };
+
+        let dynamic = DynamicImage::ImageRgba8(buffer);
+        let mut png_bytes = Vec::new();
+        if let Err(error) =
+            dynamic.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        {
+            self.set_error(format!("Failed to encode image: {error}"));
+            return;
+        }
+
+        self.session = None;
+        self.next_tick = None;
+        self.ocr_text.clear();
+        self.spawn_ocr(png_bytes);
+    }
+
+    /// Polls the non-blocking Import dialog worker and starts processing when a file is chosen.
+    fn poll_import(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.import_rx.as_ref() else {
+            return;
+        };
+
+        // Keep pumping frames even while the OS-native dialog has focus.
+        ctx.request_repaint_after(Duration::from_millis(100));
+
+        match receiver.try_recv() {
+            Ok(message) => {
+                self.import_rx = None;
+                match message {
+                    ImportResponse::Canceled => self.set_status("Import canceled."),
+                    ImportResponse::Selected {
+                        bytes,
+                        is_pdf,
+                        is_txt,
+                    } => {
+                        self.session = None;
+                        self.next_tick = None;
+                        self.ocr_text.clear();
+                        if is_txt {
+                            self.ocr_text = String::from_utf8_lossy(&bytes).trim().to_string();
+                            if self.ocr_text.is_empty() {
+                                self.set_error("No text detected. Try another file.");
+                            } else {
+                                self.set_state(UiState::Preview, "Text ready.");
+                                self.start_session();
+                            }
+                        } else if is_pdf {
+                            self.spawn_pdf_text_extract(bytes);
+                        } else {
+                            self.spawn_ocr(bytes);
+                        }
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.import_rx = None;
+                self.set_error("Import worker disconnected.");
+            }
+        }
+    }
+
+    /// Spawns a background worker to extract embedded text from a PDF file.
+    fn spawn_pdf_text_extract(&mut self, bytes: Vec<u8>) {
+        if self.ui_state == UiState::Processing {
+            self.set_status("Processing already running.");
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.ocr_rx = Some(rx);
+        self.ocr_started_at = Some(Instant::now());
+        self.set_state(UiState::Processing, "Extracting PDF text...");
+
+        thread::spawn(move || {
+            let result = pdf_extract::extract_text_from_mem(&bytes)
+                .map_err(|error| error.to_string())
+                .map(|text| text.trim().to_string());
+            let message = match result {
+                Ok(text) => OcrResponse::Success(text),
+                Err(error) => OcrResponse::Error(error),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    /// Opens an OS file picker (non-blocking) and starts OCR or PDF extraction based on selection.
+    fn import_image_from_file(&mut self) {
+        if self.ui_state == UiState::Processing || self.import_rx.is_some() {
+            self.set_status("Processing already running.");
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.import_rx = Some(rx);
+        self.set_status("Waiting for file selection...");
+
+        thread::spawn(move || {
+            let picked = pollster::block_on(
+                rfd::AsyncFileDialog::new()
+                    .add_filter(
+                        "Image",
+                        &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"],
+                    )
+                    .add_filter("PDF", &["pdf"])
+                    .add_filter("Text", &["txt"])
+                    .pick_file(),
+            );
+
+            let message = match picked {
+                None => ImportResponse::Canceled,
+                Some(file) => {
+                    let is_pdf = file
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
+                    let is_txt = file
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"));
+                    let bytes = pollster::block_on(file.read());
+                    ImportResponse::Selected {
+                        bytes,
+                        is_pdf,
+                        is_txt,
+                    }
+                }
+            };
+
+            let _ = tx.send(message);
+        });
+    }
+
+    /// Toggle playback, starting or pausing the reading session as needed.
+    fn toggle_playback(&mut self) {
+        if let Some(session) = self.session.as_ref() {
+            if session.is_playing {
+                self.pause();
+            } else {
+                self.play();
+            }
+        } else {
+            self.play();
+        }
+    }
+
+    /// Handle global keyboard shortcuts while avoiding focused text inputs.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        let mut paste = false;
+        let mut toggle_play = false;
+        let mut step_back = false;
+        let mut step_forward = false;
+        let mut restart = false;
+
+        ctx.input_mut(|input| {
+            paste |= input.consume_key(egui::Modifiers::COMMAND, egui::Key::V);
+            toggle_play |= input.consume_key(egui::Modifiers::NONE, egui::Key::Space);
+            step_back |= input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft);
+            step_forward |= input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight);
+            restart |= input.consume_key(egui::Modifiers::NONE, egui::Key::R);
+        });
+
+        if paste {
+            self.paste_image_from_clipboard();
+        }
+        if toggle_play {
+            self.toggle_playback();
+        }
+        if step_back {
+            self.rewind(5);
+        }
+        if step_forward {
+            self.advance(5);
+        }
+        if restart {
+            self.restart();
+        }
+    }
+
+    fn start_session(&mut self) {
+        let tokens = text::normalize_and_tokenize(&self.ocr_text);
+        if tokens.is_empty() {
+            self.session = None;
+            self.next_tick = None;
+            self.set_error("No readable tokens found in text.");
+            return;
+        }
+        let mut session = ReadingSession::new(self.ocr_text.clone(), tokens, self.settings.wpm);
+        session.set_chunk_size(self.settings.chunk_size);
+        session.set_playing(false);
+        self.session = Some(session);
+        self.next_tick = None;
+        self.set_state(UiState::Reading, "Ready.");
+    }
+
+    fn play(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.set_playing(true);
+            self.next_tick = None;
+            self.set_state(UiState::Reading, "Playing.");
+        } else {
+            self.set_status("Create a session before playing.");
+        }
+    }
+
+    fn pause(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.set_playing(false);
+            self.next_tick = None;
+            self.set_state(UiState::Reading, "Paused.");
+        }
+    }
+
+    fn advance(&mut self, count: usize) {
+        if let Some(session) = self.session.as_mut() {
+            session.advance(count);
+        }
+    }
+
+    fn rewind(&mut self, count: usize) {
+        if let Some(session) = self.session.as_mut() {
+            session.rewind(count);
+        }
+    }
+
+    fn restart(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.restart();
+            session.set_playing(false);
+            self.next_tick = None;
+            self.set_state(UiState::Reading, "Restarted.");
+        }
+    }
+
+    fn tick(&mut self, ctx: &egui::Context) {
+        let mut wpm_error = false;
+        let mut interval = None;
+
+        if let Some(session) = self.session.as_mut() {
+            if !session.is_playing {
+                self.next_tick = None;
+                return;
+            }
+
+            if let Some(next_interval) = interval_ms(session.wpm).map(Duration::from_millis) {
+                interval = Some(next_interval);
+                let now = Instant::now();
+                let next_tick = self.next_tick.get_or_insert_with(|| now + next_interval);
+
+                if now >= *next_tick {
+                    session.advance(session.chunk_size);
+                    *next_tick = now + next_interval;
+                }
+            } else {
+                session.set_playing(false);
+                self.next_tick = None;
+                wpm_error = true;
+            }
+        }
+
+        if wpm_error {
+            self.set_error("WPM must be greater than zero.");
+            return;
+        }
+
+        if let Some(interval) = interval {
+            ctx.request_repaint_after(interval);
+        }
+    }
+
+    fn orp_split(text: &str) -> Option<(&str, &str, &str)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let center_char_index = text.chars().count() / 2;
+        for (current, (byte_start, ch)) in text.char_indices().enumerate() {
+            if current == center_char_index {
+                let byte_end = byte_start + ch.len_utf8();
+                return Some((
+                    &text[..byte_start],
+                    &text[byte_start..byte_end],
+                    &text[byte_end..],
+                ));
+            }
+        }
+
+        // Fallback for non-empty strings if iteration fails unexpectedly.
+        let mut chars = text.char_indices();
+        let (_, first) = chars.next()?;
+        let first_len = first.len_utf8();
+        Some(("", &text[..first_len], &text[first_len..]))
+    }
+
+    fn paint_orp_text(&self, ui: &mut egui::Ui, rect: egui::Rect, text: &str) {
+        let Some((left, center, right)) = Self::orp_split(text) else {
+            return;
+        };
+
+        let font_id = egui::FontId::proportional(self.settings.font_size as f32);
+        let normal_color = ui.visuals().text_color();
+        let highlight_color = match self.settings.theme {
+            Theme::Light => egui::Color32::from_rgb(0, 120, 255),
+            _ => egui::Color32::YELLOW,
+        };
+
+        let (left_galley, center_galley, right_galley) = ui.ctx().fonts_mut(|fonts| {
+            (
+                fonts.layout_no_wrap(left.to_string(), font_id.clone(), normal_color),
+                fonts.layout_no_wrap(center.to_string(), font_id.clone(), highlight_color),
+                fonts.layout_no_wrap(right.to_string(), font_id.clone(), normal_color),
+            )
+        });
+
+        let center_x = rect.center().x;
+        let center_y = rect.center().y;
+
+        let center_pos_x = center_x - center_galley.size().x / 2.0;
+        let baseline_y = center_y - center_galley.size().y / 2.0;
+
+        let left_pos = egui::pos2(center_pos_x - left_galley.size().x, baseline_y);
+        let center_pos = egui::pos2(center_pos_x, baseline_y);
+        let right_pos = egui::pos2(center_pos_x + center_galley.size().x, baseline_y);
+
+        let painter = ui.painter_at(rect);
+        painter.galley(left_pos, left_galley, normal_color);
+        painter.galley(center_pos, center_galley, highlight_color);
+        painter.galley(right_pos, right_galley, normal_color);
+    }
+
+    fn truncate_words(text: &str, limit: usize) -> String {
+        let mut words = text.split_whitespace();
+        let mut taken: Vec<&str> = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            let Some(word) = words.next() else {
+                break;
+            };
+            taken.push(word);
+        }
+        let truncated = words.next().is_some();
+        let mut output = taken.join(" ");
+        if truncated && !output.is_empty() {
+            output.push_str(" ...");
+        }
+        output
+    }
+
+    /// Renders the detached editor viewport UI and returns any user action.
+    fn render_ocr_editor(&mut self, ctx: &egui::Context) -> EditorAction {
+        let mut action = EditorAction::default();
+
+        // If the user closes the editor viewport via the window manager, hide it next frame.
+        if ctx.input(|input| input.viewport().close_requested()) {
+            action.cancel = true;
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let buttons_height = ui.spacing().interact_size.y;
+            let editor_height = (ui.available_height() - buttons_height - 12.0).max(120.0);
+
+            egui::ScrollArea::vertical()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .max_height(editor_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        egui::vec2(ui.available_width(), editor_height),
+                        egui::TextEdit::multiline(&mut self.ocr_editor_draft)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(24)
+                            .code_editor(),
+                    );
+                });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                action.save |= ui.button("Save").clicked();
+                action.cancel |= ui.button("Cancel").clicked();
+            });
+        });
+
+        action
+    }
+}
+
+impl eframe::App for AthenaApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let editor_viewport_id = egui::ViewportId::from_hash_of("ocr_editor_viewport");
+
+        // If the root viewport is closing, ensure the editor viewport closes too.
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.ocr_editor_open = false;
+            ctx.send_viewport_cmd_to(editor_viewport_id, egui::ViewportCommand::Close);
+        }
+
+        self.tick(ctx);
+        self.handle_shortcuts(ctx);
+        self.poll_import(ctx);
+        self.poll_ocr(ctx);
+
+        let can_paste = self.ui_state != UiState::Processing;
+        let is_playing = self
+            .session
+            .as_ref()
+            .map(|session| session.is_playing)
+            .unwrap_or(false);
+        let has_session = self.session.is_some();
+        let can_play = has_session && !is_playing;
+        let can_pause = has_session && is_playing;
+        let can_nav = has_session;
+        let can_restart = has_session;
+        let word_progress = self.session.as_ref().and_then(|session| {
+            let (index, total) = session.progress();
+            (total > 0).then(|| format!("{index}/{total}"))
+        });
+
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(can_paste, egui::Button::new("Import"))
+                    .clicked()
+                {
+                    self.import_image_from_file();
+                }
+                if ui
+                    .add_enabled(can_paste, egui::Button::new("Paste Image"))
+                    .clicked()
+                {
+                    self.paste_image_from_clipboard();
+                }
+                if ui
+                    .add_enabled(can_play, egui::Button::new("Play"))
+                    .clicked()
+                {
+                    self.play();
+                }
+                if ui
+                    .add_enabled(can_pause, egui::Button::new("Pause"))
+                    .clicked()
+                {
+                    self.pause();
+                }
+                if ui.add_enabled(can_nav, egui::Button::new("Prev")).clicked() {
+                    self.rewind(5);
+                }
+                if ui.add_enabled(can_nav, egui::Button::new("Next")).clicked() {
+                    self.advance(5);
+                }
+                if ui
+                    .add_enabled(can_restart, egui::Button::new("Restart"))
+                    .clicked()
+                {
+                    self.restart();
+                }
+            });
+
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label("WPM");
+                let wpm_changed = ui
+                    .add(egui::Slider::new(&mut self.settings.wpm, 100..=900))
+                    .changed();
+
+                ui.label("Chunk");
+                let chunk_changed = ui
+                    .add(egui::Slider::new(&mut self.settings.chunk_size, 1..=5))
+                    .changed();
+
+                ui.label("Font");
+                let font_changed = ui
+                    .add(egui::Slider::new(&mut self.settings.font_size, 18..=200))
+                    .changed();
+
+                ui.label("Theme");
+                let theme_changed = egui::ComboBox::from_id_salt("theme_combo")
+                    .selected_text(match self.settings.theme {
+                        Theme::Light => "Light",
+                        Theme::Dark => "Dark",
+                        Theme::HighContrast => "High Contrast",
+                    })
+                    .show_ui(ui, |ui| {
+                        let mut changed = false;
+                        changed |= ui
+                            .selectable_value(&mut self.settings.theme, Theme::Light, "Light")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(&mut self.settings.theme, Theme::Dark, "Dark")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.settings.theme,
+                                Theme::HighContrast,
+                                "High Contrast",
+                            )
+                            .changed();
+                        changed
+                    })
+                    .inner
+                    .unwrap_or(false);
+
+                if wpm_changed && let Some(session) = self.session.as_mut() {
+                    session.set_wpm(self.settings.wpm);
+                    self.next_tick = None;
+                }
+                if chunk_changed && let Some(session) = self.session.as_mut() {
+                    session.set_chunk_size(self.settings.chunk_size);
+                }
+                if font_changed || wpm_changed || chunk_changed {
+                    self.persist_settings();
+                }
+                if theme_changed {
+                    apply_theme(ctx, &self.settings.theme);
+                    self.persist_settings();
+                }
+            });
+        });
+
+        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Preview:");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(progress) = word_progress.as_deref() {
+                            ui.label(progress);
+                        }
+                    });
+                });
+                let mut preview = Self::truncate_words(&self.ocr_text, OCR_PREVIEW_WORD_LIMIT);
+                let response = ui.add(
+                    egui::TextEdit::multiline(&mut preview)
+                        .desired_rows(6)
+                        .interactive(false),
+                );
+                let click_response = ui.interact(
+                    response.rect,
+                    ui.make_persistent_id("ocr_preview_click"),
+                    egui::Sense::click(),
+                );
+                if click_response.double_clicked() {
+                    self.ocr_editor_draft = self.ocr_text.clone();
+                    self.ocr_editor_open = true;
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let available = ui.available_rect_before_wrap();
+            let displayed = self
+                .session
+                .as_ref()
+                .map(|session| session.current_chunk().join(" "));
+
+            if let Some(text) = displayed.as_deref() {
+                self.paint_orp_text(ui, available, text);
+            }
+        });
+
+        egui::Area::new("status_area".into())
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -10.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                    ui.add(egui::Label::new(&self.status).extend());
+                    if let Some(progress) = self.ocr_progress() {
+                        ui.add(egui::Label::new(progress).extend());
+                    }
+                    if self.ui_state == UiState::Processing {
+                        ui.add(egui::Spinner::new());
+                    }
+                });
+            });
+
+        if self.ocr_editor_open {
+            let action = ctx.show_viewport_immediate(
+                editor_viewport_id,
+                egui::ViewportBuilder::default()
+                    .with_title("Edit Text")
+                    .with_inner_size(egui::vec2(720.0, 480.0))
+                    .with_min_inner_size(egui::vec2(520.0, 320.0))
+                    .with_resizable(true),
+                |ctx, class| match class {
+                    egui::ViewportClass::Embedded => {
+                        // Fallback: embed the editor window in the parent viewport.
+                        let mut action = EditorAction::default();
+                        egui::Window::new("Edit Text")
+                            .open(&mut self.ocr_editor_open)
+                            .resizable(true)
+                            .default_size(egui::vec2(720.0, 480.0))
+                            .min_size(egui::vec2(520.0, 320.0))
+                            .show(ctx, |ui| {
+                                let buttons_height = ui.spacing().interact_size.y;
+                                let editor_height =
+                                    (ui.available_height() - buttons_height - 12.0).max(120.0);
+                                egui::ScrollArea::vertical()
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                                    )
+                                    .max_height(editor_height)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.add_sized(
+                                            egui::vec2(ui.available_width(), editor_height),
+                                            egui::TextEdit::multiline(&mut self.ocr_editor_draft)
+                                                .desired_width(f32::INFINITY)
+                                                .desired_rows(24)
+                                                .code_editor(),
+                                        );
+                                    });
+
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    action.save |= ui.button("Save").clicked();
+                                    action.cancel |= ui.button("Cancel").clicked();
+                                });
+                            });
+                        action
+                    }
+                    _ => self.render_ocr_editor(ctx),
+                },
+            );
+
+            if action.cancel {
+                self.ocr_editor_open = false;
+                ctx.send_viewport_cmd_to(editor_viewport_id, egui::ViewportCommand::Close);
+            }
+            if action.save {
+                self.ocr_text = self.ocr_editor_draft.trim().to_string();
+                self.session = None;
+                self.next_tick = None;
+                self.start_session();
+                self.ocr_editor_open = false;
+                ctx.send_viewport_cmd_to(editor_viewport_id, egui::ViewportCommand::Close);
+            }
+        }
+    }
+}
+
+/// Returns the per-user configuration path for saved settings.
+fn settings_path() -> Option<PathBuf> {
+    ProjectDirs::from("com", "athena", "reader").map(|dirs| dirs.config_dir().join("settings.json"))
+}
+
+/// Returns the cache directory used for OCR model storage.
+fn model_cache_dir() -> Option<PathBuf> {
+    if let Ok(path) = env::var(ENV_OCR_CACHE_DIR)
+        && !path.trim().is_empty()
+    {
+        return Some(PathBuf::from(path));
+    }
+    ProjectDirs::from("com", "athena", "reader").map(|dirs| dirs.cache_dir().join("ocrs"))
+}
+
+/// Parses a boolean environment flag based on common truthy strings.
+fn env_var_truthy(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Builds the OCR model download configuration using environment overrides.
+fn model_download_config() -> OcrModelDownloadConfig {
+    let detection_url =
+        env::var(ENV_OCR_DETECTION_URL).unwrap_or_else(|_| DEFAULT_DETECTION_URL.into());
+    let recognition_url =
+        env::var(ENV_OCR_RECOGNITION_URL).unwrap_or_else(|_| DEFAULT_RECOGNITION_URL.into());
+    let dict_url = env::var(ENV_OCR_DICT_URL).unwrap_or_else(|_| DEFAULT_DICT_URL.into());
+    let detection_sha256 = env::var(ENV_OCR_DETECTION_SHA256)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let recognition_sha256 = env::var(ENV_OCR_RECOGNITION_SHA256)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let dict_sha256 = env::var(ENV_OCR_DICT_SHA256)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let allow_download = !env_var_truthy(ENV_OCR_DISABLE_DOWNLOAD);
+
+    OcrModelDownloadConfig::new(
+        OcrModelDownloadInfo::new(detection_url, detection_sha256),
+        OcrModelDownloadInfo::new(recognition_url, recognition_sha256),
+        OcrModelDownloadInfo::new(dict_url, dict_sha256),
+        allow_download,
+    )
+}
+
+/// Resolves OCR model file paths from environment overrides and cache defaults.
+fn default_model_paths() -> Option<OcrModelPaths> {
+    let detection_env = env::var(ENV_OCR_DETECTION_MODEL)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let recognition_env = env::var(ENV_OCR_RECOGNITION_MODEL)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let dict_env = env::var(ENV_OCR_DICT_PATH)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let cache_dir = model_cache_dir();
+
+    let detection = detection_env.or_else(|| {
+        cache_dir
+            .as_ref()
+            .map(|dir| dir.join(DEFAULT_DETECTION_FILENAME))
+    })?;
+    let recognition = recognition_env.or_else(|| {
+        cache_dir
+            .as_ref()
+            .map(|dir| dir.join(DEFAULT_RECOGNITION_FILENAME))
+    })?;
+    let dict = dict_env.or_else(|| {
+        cache_dir
+            .as_ref()
+            .map(|dir| dir.join(DEFAULT_DICT_FILENAME))
+    })?;
+
+    Some(OcrModelPaths::new(detection, recognition, dict))
+}
+
+/// Applies egui visuals based on the user-selected theme.
+fn apply_theme(ctx: &egui::Context, theme: &Theme) {
+    match theme {
+        Theme::Light => {
+            let mut visuals = egui::Visuals::light();
+            visuals.override_text_color = Some(egui::Color32::BLACK);
+            ctx.set_visuals(visuals);
+        }
+        Theme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+        Theme::HighContrast => {
+            let mut visuals = egui::Visuals::dark();
+            visuals.override_text_color = Some(egui::Color32::WHITE);
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::BLACK;
+            visuals.widgets.inactive.bg_fill = egui::Color32::BLACK;
+            ctx.set_visuals(visuals);
+        }
+    }
+}
+
+/// GUI entry point.
+fn main() -> eframe::Result<()> {
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 540.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Athena Reader",
+        native_options,
+        Box::new(|cc| Ok(Box::new(AthenaApp::new(cc)))),
+    )
+}

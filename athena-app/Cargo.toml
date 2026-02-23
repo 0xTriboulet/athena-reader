@@ -1,0 +1,14 @@
+[package]
+name = "athena-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+athena-core = { path = "../athena-core" }
+arboard = "3"
+directories = "5"
+eframe = "0.33"
+image = "0.25"
+pdf-extract = "0.8"
+pollster = "0.4"
+rfd = "0.15"
