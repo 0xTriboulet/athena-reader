@@ -1,6 +1,5 @@
 # Rust
 /target/
-**/*.rs.bk
 
 # OS / Editor
 .DS_Store

@@ -11,6 +11,8 @@ This repository is a Rust workspace with:
 - `athena-core`: OCR + text normalization/tokenization + reading session logic
 - `athena-app`: egui/eframe GUI application
 
+<video controls src="media/Screencast from 2026-02-22 19-33-17.mp4" title="Title"></video>
+
 ## How it works (User flow)
 
 1. Launch the app.
