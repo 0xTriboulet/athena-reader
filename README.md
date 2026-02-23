@@ -11,7 +11,9 @@ This repository is a Rust workspace with:
 - `athena-core`: OCR + text normalization/tokenization + reading session logic
 - `athena-app`: egui/eframe GUI application
 
-![alt text](<Screencast from 2026-02-22 19-33-17.gif>)
+<p align="center">
+  <img src="Screencast%20from%202026-02-22%2019-33-17.gif" alt="Demo" />
+</p>
 
 ## How it works (User flow)
 
