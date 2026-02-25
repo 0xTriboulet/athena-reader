@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-02-25
+
+### Added
+- EPUB import support via the Import flow
+- Persisted paused-reading cache (text + position) restored on app restart
+- Unified clipboard paste flow for text and images, with text preferred when both exist
+
+### Changed
+- Import now supports images, PDFs, `.epub`, and `.txt` files
+- Preview double-click now pauses active playback before opening the editor
+- Editor save now rebuilds/remaps the stream to the equivalent reading position after text edits
+- Controller row spacing improved for clearer separation from the text section
+- Documentation expanded for feature coverage and behavior details in `README.md` and `notes/specification.md`
+
 ## [0.1.0] - 2026-02-23
 
 ### Added

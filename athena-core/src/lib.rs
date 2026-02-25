@@ -6,6 +6,8 @@
 //! - Reading session state and timing helpers
 //! - User settings persistence types
 
+/// EPUB text extraction using the `epub-stream` crate.
+pub mod epub;
 /// OCR engine abstraction, model downloads, and image preprocessing helpers.
 pub mod ocr;
 /// Reading session state (current index, chunking, WPM timing).

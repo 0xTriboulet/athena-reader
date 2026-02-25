@@ -1,9 +1,10 @@
 [package]
 name = "athena-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
+epub-stream = { git = "https://github.com/h0rv/epub-stream", branch = "main" }
 image = "0.25"
 oar-ocr = "0.6.1"
 sha2 = "0.10"

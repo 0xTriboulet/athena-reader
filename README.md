@@ -2,7 +2,7 @@
 
 Athena Reader is a native desktop speed-reading tool:
 
-- Paste a screenshot from your clipboard
+- Paste text or a screenshot from your clipboard
 - Run OCR locally (offline after models are cached)
 - Stream the extracted text at a target WPM using an ORP-style centered word display
 
@@ -10,6 +10,16 @@ This repository is a Rust workspace with:
 
 - `athena-core`: OCR + text normalization/tokenization + reading session logic
 - `athena-app`: egui/eframe GUI application
+
+## Capabilities at a glance
+
+- Import files: image (`png/jpg/jpeg/bmp/tif/tiff/webp`), PDF, EPUB, and `.txt`
+- Paste text or image from clipboard (**Ctrl/Cmd+V**)
+- Non-blocking background processing for import/OCR/extraction
+- ORP-style centered reading display with configurable WPM, chunk size, font size, and theme
+- Read-only preview with separate **Edit Text** window (double-click preview)
+- Editor-open pauses playback; editor-save rebuilds playback text and remaps reading position
+- Local persistence of user settings and paused reading position across app restarts
 
 <p align="center">
   <img src="Screencast%20from%202026-02-22%2019-33-17.gif" alt="Demo" />
@@ -19,30 +29,46 @@ This repository is a Rust workspace with:
 
 1. Launch the app.
 2. Bring text into the app:
-   - **Import**: pick an image file, a PDF, or a `.txt` file.
-   - **Paste Image**: paste an image from the system clipboard (button or **Ctrl/Cmd+V**).
+   - **Import**: pick an image file, a PDF, an EPUB, or a `.txt` file.
+   - **Paste**: paste text or an image from the system clipboard (button or **Ctrl/Cmd+V**).
 3. Processing runs in a background thread (UI stays responsive).
    - OCR from images typically takes a few seconds depending on the image size/quality and your machine.
 4. The bottom preview shows the first **25 words** of extracted text.
-5. Double-click the preview to open **Edit Text** in a separate window; **Save** updates the text used for playback.
+5. Double-click the preview to open **Edit Text** in a separate window.
+   - If playback is running, opening the editor pauses it.
+   - **Save** rebuilds the reading session from edited text and keeps the closest logical reading position; if the old position is no longer valid, it resets to the start.
 6. The reading view shows the first word/chunk immediately; press **Play** (or **Space**) to begin streaming.
+7. While paused, navigation/edit saves update the cached reading snapshot; reopening the app restores that paused text/position.
 
 ## Controls / Shortcuts
 
-- Paste image: **Ctrl/Cmd+V**
+- Paste clipboard text/image: **Ctrl/Cmd+V**
 - Play/Pause: **Space**
-- Step back/forward: **Left / Right arrow**
+- Step back/forward by 5 words: **Left / Right arrow**
 - Restart (resets to first word and pauses): **R**
 
-## Importing PDFs
+## Import behavior and limits
 
-PDF import extracts embedded text (for text-based PDFs). Scanned/image-only PDFs will generally produce empty text and show an error.
+| Input type | Processing path | Notes |
+| --- | --- | --- |
+| Image files | OCR (`oar-ocr`) | Runs locally once models are available. |
+| Clipboard image | OCR (`oar-ocr`) | Clipboard must contain image data. |
+| PDF | `pdf-extract` embedded-text extraction | Scanned/image-only PDFs usually return empty text and show an error. |
+| EPUB | `epub-stream` chapter extraction | Extracts plain text from spine chapters in reading order. |
+| `.txt` | UTF-8 lossy decode (`String::from_utf8_lossy`) | Invalid UTF-8 bytes are replaced with replacement characters. |
+| Clipboard text | Direct text load | Whitespace is trimmed; if both text and image exist, text is preferred. |
+
+## Persistence behavior
+
+- **Settings**: WPM, chunk size, font size, and theme are saved to `settings.json` in the app config directory.
+- **Paused reading cache**: text + current token index are saved to `reading_cache.json` in the app config directory.
+- On startup, the app restores a valid paused session automatically; invalid/out-of-range cached indices reset to index `0`.
 
 ## UI Components (Quick Guide)
 
 - **Top controls**
-  - **Import**: select an image or PDF.
-  - **Paste Image**: reads an image from the clipboard and runs OCR.
+  - **Import**: select an image, PDF, EPUB, or text file.
+  - **Paste**: loads clipboard text directly when available; otherwise falls back to image OCR.
   - **Play / Pause / Prev / Next / Restart**: playback controls.
   - Sliders:
     - **WPM**: 100–900

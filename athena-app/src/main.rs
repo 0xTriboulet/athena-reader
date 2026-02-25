@@ -1,8 +1,8 @@
 //! Athena Reader GUI application.
 //!
 //! This binary provides an egui/eframe UI that can:
-//! - Paste an image from the clipboard and run OCR
-//! - Import images or PDFs (PDFs use embedded-text extraction)
+//! - Paste text or an image from the clipboard
+//! - Import images, PDFs, EPUBs, or text files
 //! - Preview and edit extracted text
 //! - Stream words/chunks at a target WPM using an ORP-style centered display
 
@@ -21,7 +21,10 @@ use athena_core::ocr::{
     OcrModelDownloadConfig, OcrModelDownloadInfo, OcrModelPaths, OcrResult, ensure_models,
 };
 use athena_core::reader::{ReadingSession, interval_ms};
-use athena_core::settings::{Theme, UserSettings, load_settings, save_settings};
+use athena_core::settings::{
+    ReadingCache, Theme, UserSettings, clear_reading_cache, load_reading_cache, load_settings,
+    save_reading_cache, save_settings,
+};
 use athena_core::text;
 use directories::ProjectDirs;
 use eframe::egui;
@@ -71,11 +74,12 @@ enum OcrResponse {
 enum ImportResponse {
     /// User canceled the dialog.
     Canceled,
-    /// File selected; `bytes` contains file contents and `is_pdf` controls processing path.
+    /// File selected; `bytes` contains file contents and flags control processing path.
     Selected {
         bytes: Vec<u8>,
         is_pdf: bool,
         is_txt: bool,
+        is_epub: bool,
     },
 }
 
@@ -86,6 +90,16 @@ struct EditorAction {
     save: bool,
     /// Close without saving.
     cancel: bool,
+}
+
+/// Captures the reading position context at the moment the editor is opened.
+#[derive(Debug, Clone)]
+struct EditAnchor {
+    token: String,
+    token_occurrence: usize,
+    old_index: usize,
+    prev_token: Option<String>,
+    next_token: Option<String>,
 }
 
 /// Top-level egui application state for Athena Reader.
@@ -100,10 +114,12 @@ struct AthenaApp {
     model_download: OcrModelDownloadConfig,
     settings: UserSettings,
     settings_path: Option<PathBuf>,
+    reading_cache_path: Option<PathBuf>,
     next_tick: Option<Instant>,
     ocr_rx: Option<mpsc::Receiver<OcrResponse>>,
     ocr_started_at: Option<Instant>,
     import_rx: Option<mpsc::Receiver<ImportResponse>>,
+    edit_anchor: Option<EditAnchor>,
 }
 
 impl AthenaApp {
@@ -113,27 +129,54 @@ impl AthenaApp {
         cc.egui_ctx.set_embed_viewports(false);
 
         let settings_path = settings_path();
+        let reading_cache_path = reading_cache_path();
         let settings = settings_path
             .as_ref()
             .and_then(|path| load_settings(path).ok())
             .unwrap_or_default();
         apply_theme(&cc.egui_ctx, &settings.theme);
 
+        let mut ui_state = UiState::Idle;
+        let mut status = "Paste text or an image to get started.".to_string();
+        let mut ocr_text = String::new();
+        let mut session = None;
+
+        if let Some(path) = reading_cache_path.as_ref() {
+            match load_reading_cache(path) {
+                Ok(Some(cache)) => {
+                    if let Some((restored_text, restored_session)) =
+                        build_restored_session(&cache.text, &settings, cache.current_index)
+                    {
+                        ocr_text = restored_text;
+                        session = Some(restored_session);
+                        ui_state = UiState::Reading;
+                        status = "Restored paused session.".to_string();
+                    } else {
+                        let _ = clear_reading_cache(path);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
+
         Self {
-            ui_state: UiState::Idle,
-            status: "Paste an image to run OCR.".to_string(),
-            ocr_text: String::new(),
+            ui_state,
+            status,
+            ocr_text,
             ocr_editor_open: false,
             ocr_editor_draft: String::new(),
-            session: None,
+            session,
             model_paths: default_model_paths(),
             model_download: model_download_config(),
             settings,
             settings_path,
+            reading_cache_path,
             next_tick: None,
             ocr_rx: None,
             ocr_started_at: None,
             import_rx: None,
+            edit_anchor: None,
         }
     }
 
@@ -142,6 +185,42 @@ impl AthenaApp {
             && let Err(error) = save_settings(path, &self.settings)
         {
             self.set_status(format!("Failed to save settings: {error}"));
+        }
+    }
+
+    fn persist_paused_reading_cache(&mut self) {
+        let Some(path) = self.reading_cache_path.as_ref() else {
+            return;
+        };
+
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+
+        if session.tokens.is_empty() || self.ocr_text.trim().is_empty() {
+            if let Err(error) = clear_reading_cache(path) {
+                self.set_status(format!("Failed to clear reading cache: {error}"));
+            }
+            return;
+        }
+
+        let cache = ReadingCache {
+            text: self.ocr_text.clone(),
+            current_index: session
+                .current_index
+                .min(session.tokens.len().saturating_sub(1)),
+        };
+        if let Err(error) = save_reading_cache(path, &cache) {
+            self.set_status(format!("Failed to save reading cache: {error}"));
+        }
+    }
+
+    fn clear_paused_reading_cache(&mut self) {
+        let Some(path) = self.reading_cache_path.as_ref() else {
+            return;
+        };
+        if let Err(error) = clear_reading_cache(path) {
+            self.set_status(format!("Failed to clear reading cache: {error}"));
         }
     }
 
@@ -261,8 +340,13 @@ impl AthenaApp {
         })
     }
 
-    /// Reads an image from the clipboard and starts OCR.
-    fn paste_image_from_clipboard(&mut self) {
+    /// Reads text or an image from the clipboard and starts reading/OCR.
+    fn paste_from_clipboard(&mut self) {
+        if self.ui_state == UiState::Processing {
+            self.set_status("Processing already running.");
+            return;
+        }
+
         let mut clipboard = match Clipboard::new() {
             Ok(clipboard) => clipboard,
             Err(error) => {
@@ -271,10 +355,22 @@ impl AthenaApp {
             }
         };
 
+        if let Ok(text) = clipboard.get_text() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                self.session = None;
+                self.next_tick = None;
+                self.ocr_text = trimmed.to_string();
+                self.set_state(UiState::Preview, "Text ready.");
+                self.start_session();
+                return;
+            }
+        }
+
         let image = match clipboard.get_image() {
             Ok(image) => image,
             Err(error) => {
-                self.set_error(format!("No image in clipboard: {error}"));
+                self.set_error(format!("No text or image in clipboard: {error}"));
                 return;
             }
         };
@@ -324,6 +420,7 @@ impl AthenaApp {
                         bytes,
                         is_pdf,
                         is_txt,
+                        is_epub,
                     } => {
                         self.session = None;
                         self.next_tick = None;
@@ -336,6 +433,8 @@ impl AthenaApp {
                                 self.set_state(UiState::Preview, "Text ready.");
                                 self.start_session();
                             }
+                        } else if is_epub {
+                            self.spawn_epub_text_extract(bytes);
                         } else if is_pdf {
                             self.spawn_pdf_text_extract(bytes);
                         } else {
@@ -376,6 +475,28 @@ impl AthenaApp {
         });
     }
 
+    /// Spawns a background worker to extract plain text from an EPUB file.
+    fn spawn_epub_text_extract(&mut self, bytes: Vec<u8>) {
+        if self.ui_state == UiState::Processing {
+            self.set_status("Processing already running.");
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.ocr_rx = Some(rx);
+        self.ocr_started_at = Some(Instant::now());
+        self.set_state(UiState::Processing, "Extracting EPUB text...");
+
+        thread::spawn(move || {
+            let result = athena_core::epub::extract_text_from_bytes(&bytes);
+            let message = match result {
+                Ok(text) => OcrResponse::Success(text),
+                Err(error) => OcrResponse::Error(error),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
     /// Opens an OS file picker (non-blocking) and starts OCR or PDF extraction based on selection.
     fn import_image_from_file(&mut self) {
         if self.ui_state == UiState::Processing || self.import_rx.is_some() {
@@ -395,6 +516,7 @@ impl AthenaApp {
                         &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"],
                     )
                     .add_filter("PDF", &["pdf"])
+                    .add_filter("EPUB", &["epub"])
                     .add_filter("Text", &["txt"])
                     .pick_file(),
             );
@@ -412,11 +534,17 @@ impl AthenaApp {
                         .extension()
                         .and_then(|ext| ext.to_str())
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"));
+                    let is_epub = file
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
                     let bytes = pollster::block_on(file.read());
                     ImportResponse::Selected {
                         bytes,
                         is_pdf,
                         is_txt,
+                        is_epub,
                     }
                 }
             };
@@ -459,7 +587,7 @@ impl AthenaApp {
         });
 
         if paste {
-            self.paste_image_from_clipboard();
+            self.paste_from_clipboard();
         }
         if toggle_play {
             self.toggle_playback();
@@ -480,6 +608,8 @@ impl AthenaApp {
         if tokens.is_empty() {
             self.session = None;
             self.next_tick = None;
+            self.edit_anchor = None;
+            self.clear_paused_reading_cache();
             self.set_error("No readable tokens found in text.");
             return;
         }
@@ -488,7 +618,57 @@ impl AthenaApp {
         session.set_playing(false);
         self.session = Some(session);
         self.next_tick = None;
+        self.edit_anchor = None;
         self.set_state(UiState::Reading, "Ready.");
+        self.persist_paused_reading_cache();
+    }
+
+    fn open_editor_from_preview(&mut self) {
+        self.edit_anchor = self
+            .session
+            .as_ref()
+            .and_then(|session| build_edit_anchor(&session.tokens, session.current_index));
+
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.is_playing)
+        {
+            self.pause();
+        }
+
+        self.ocr_editor_draft = self.ocr_text.clone();
+        self.ocr_editor_open = true;
+    }
+
+    fn apply_editor_save(&mut self) {
+        self.ocr_text = self.ocr_editor_draft.trim().to_string();
+        let tokens = text::normalize_and_tokenize(&self.ocr_text);
+        if tokens.is_empty() {
+            self.session = None;
+            self.next_tick = None;
+            self.edit_anchor = None;
+            self.clear_paused_reading_cache();
+            self.set_error("No readable tokens found in text.");
+            return;
+        }
+
+        let mapped_index = self
+            .edit_anchor
+            .as_ref()
+            .map(|anchor| remap_index_after_edit(anchor, &tokens))
+            .unwrap_or(0);
+
+        let mut session = ReadingSession::new(self.ocr_text.clone(), tokens, self.settings.wpm);
+        session.set_chunk_size(self.settings.chunk_size);
+        session.set_playing(false);
+        session.current_index = mapped_index.min(session.tokens.len().saturating_sub(1));
+
+        self.session = Some(session);
+        self.next_tick = None;
+        self.edit_anchor = None;
+        self.set_state(UiState::Reading, "Ready.");
+        self.persist_paused_reading_cache();
     }
 
     fn play(&mut self) {
@@ -502,31 +682,51 @@ impl AthenaApp {
     }
 
     fn pause(&mut self) {
+        let mut paused = false;
         if let Some(session) = self.session.as_mut() {
             session.set_playing(false);
             self.next_tick = None;
             self.set_state(UiState::Reading, "Paused.");
+            paused = true;
+        }
+        if paused {
+            self.persist_paused_reading_cache();
         }
     }
 
     fn advance(&mut self, count: usize) {
+        let mut persist_after = false;
         if let Some(session) = self.session.as_mut() {
             session.advance(count);
+            persist_after = !session.is_playing;
+        }
+        if persist_after {
+            self.persist_paused_reading_cache();
         }
     }
 
     fn rewind(&mut self, count: usize) {
+        let mut persist_after = false;
         if let Some(session) = self.session.as_mut() {
             session.rewind(count);
+            persist_after = !session.is_playing;
+        }
+        if persist_after {
+            self.persist_paused_reading_cache();
         }
     }
 
     fn restart(&mut self) {
+        let mut restarted = false;
         if let Some(session) = self.session.as_mut() {
             session.restart();
             session.set_playing(false);
             self.next_tick = None;
             self.set_state(UiState::Reading, "Restarted.");
+            restarted = true;
+        }
+        if restarted {
+            self.persist_paused_reading_cache();
         }
     }
 
@@ -722,10 +922,10 @@ impl eframe::App for AthenaApp {
                     self.import_image_from_file();
                 }
                 if ui
-                    .add_enabled(can_paste, egui::Button::new("Paste Image"))
+                    .add_enabled(can_paste, egui::Button::new("Paste"))
                     .clicked()
                 {
-                    self.paste_image_from_clipboard();
+                    self.paste_from_clipboard();
                 }
                 if ui
                     .add_enabled(can_play, egui::Button::new("Play"))
@@ -813,6 +1013,7 @@ impl eframe::App for AthenaApp {
                     self.persist_settings();
                 }
             });
+            ui.add_space(8.0);
         });
 
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
@@ -837,8 +1038,7 @@ impl eframe::App for AthenaApp {
                     egui::Sense::click(),
                 );
                 if click_response.double_clicked() {
-                    self.ocr_editor_draft = self.ocr_text.clone();
-                    self.ocr_editor_open = true;
+                    self.open_editor_from_preview();
                 }
             });
         });
@@ -922,13 +1122,11 @@ impl eframe::App for AthenaApp {
 
             if action.cancel {
                 self.ocr_editor_open = false;
+                self.edit_anchor = None;
                 ctx.send_viewport_cmd_to(editor_viewport_id, egui::ViewportCommand::Close);
             }
             if action.save {
-                self.ocr_text = self.ocr_editor_draft.trim().to_string();
-                self.session = None;
-                self.next_tick = None;
-                self.start_session();
+                self.apply_editor_save();
                 self.ocr_editor_open = false;
                 ctx.send_viewport_cmd_to(editor_viewport_id, egui::ViewportCommand::Close);
             }
@@ -936,9 +1134,120 @@ impl eframe::App for AthenaApp {
     }
 }
 
+fn build_edit_anchor(tokens: &[String], current_index: usize) -> Option<EditAnchor> {
+    let token = tokens.get(current_index)?.clone();
+    let token_occurrence = tokens
+        .iter()
+        .take(current_index + 1)
+        .filter(|item| item.as_str() == token.as_str())
+        .count();
+    let prev_token = current_index
+        .checked_sub(1)
+        .and_then(|index| tokens.get(index))
+        .cloned();
+    let next_token = tokens.get(current_index + 1).cloned();
+    Some(EditAnchor {
+        token,
+        token_occurrence,
+        old_index: current_index,
+        prev_token,
+        next_token,
+    })
+}
+
+fn remap_index_after_edit(anchor: &EditAnchor, new_tokens: &[String]) -> usize {
+    if new_tokens.is_empty() {
+        return 0;
+    }
+
+    let same_index_candidate = (anchor.old_index < new_tokens.len()).then_some(anchor.old_index);
+    let anchor_token_candidate =
+        find_token_occurrence(new_tokens, &anchor.token, anchor.token_occurrence);
+
+    match (same_index_candidate, anchor_token_candidate) {
+        (Some(same), Some(anchor_match)) if same == anchor_match => same,
+        (Some(same), Some(anchor_match)) => {
+            let same_score = remap_context_score(anchor, new_tokens, same);
+            let anchor_score = remap_context_score(anchor, new_tokens, anchor_match);
+            if anchor_score > same_score {
+                anchor_match
+            } else {
+                same
+            }
+        }
+        (Some(same), None) => same,
+        (None, Some(anchor_match)) => anchor_match,
+        (None, None) => 0,
+    }
+}
+
+fn find_token_occurrence(
+    tokens: &[String],
+    needle: &str,
+    target_occurrence: usize,
+) -> Option<usize> {
+    if target_occurrence == 0 {
+        return None;
+    }
+
+    let mut seen = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        if token == needle {
+            seen += 1;
+            if seen == target_occurrence {
+                return Some(index);
+            }
+        }
+    }
+
+    None
+}
+
+fn remap_context_score(anchor: &EditAnchor, tokens: &[String], index: usize) -> usize {
+    let prev_matches = anchor.prev_token.as_deref()
+        == index
+            .checked_sub(1)
+            .and_then(|idx| tokens.get(idx))
+            .map(String::as_str);
+    let next_matches = anchor.next_token.as_deref() == tokens.get(index + 1).map(String::as_str);
+    usize::from(prev_matches) + usize::from(next_matches)
+}
+
+fn build_restored_session(
+    text_input: &str,
+    settings: &UserSettings,
+    current_index: usize,
+) -> Option<(String, ReadingSession)> {
+    let restored_text = text_input.trim().to_string();
+    if restored_text.is_empty() {
+        return None;
+    }
+
+    let tokens = text::normalize_and_tokenize(&restored_text);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut session = ReadingSession::new(restored_text.clone(), tokens, settings.wpm);
+    session.set_chunk_size(settings.chunk_size);
+    session.set_playing(false);
+    session.current_index = if current_index < session.tokens.len() {
+        current_index
+    } else {
+        0
+    };
+    Some((restored_text, session))
+}
+
 /// Returns the per-user configuration path for saved settings.
 fn settings_path() -> Option<PathBuf> {
     ProjectDirs::from("com", "athena", "reader").map(|dirs| dirs.config_dir().join("settings.json"))
+}
+
+/// Returns the persisted paused-reading cache path.
+fn reading_cache_path() -> Option<PathBuf> {
+    ProjectDirs::from("com", "athena", "reader")
+        .map(|dirs| dirs.config_dir().join("reading_cache.json"))
 }
 
 /// Returns the cache directory used for OCR model storage.
@@ -1038,6 +1347,74 @@ fn apply_theme(ctx: &egui::Context, theme: &Theme) {
             visuals.widgets.inactive.bg_fill = egui::Color32::BLACK;
             ctx.set_visuals(visuals);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_edit_anchor, build_restored_session, remap_index_after_edit};
+    use athena_core::settings::UserSettings;
+
+    fn tokens(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn remap_tracks_word_when_prefix_word_removed() {
+        let old_tokens = tokens(&["one", "two", "three"]);
+        let anchor = build_edit_anchor(&old_tokens, 1).expect("anchor should exist");
+        let new_tokens = tokens(&["two", "three"]);
+        assert_eq!(remap_index_after_edit(&anchor, &new_tokens), 0);
+    }
+
+    #[test]
+    fn remap_keeps_same_index_when_anchor_missing_but_index_valid() {
+        let old_tokens = tokens(&["alpha", "beta", "gamma"]);
+        let anchor = build_edit_anchor(&old_tokens, 2).expect("anchor should exist");
+        let new_tokens = tokens(&["one", "two", "three", "four"]);
+        assert_eq!(remap_index_after_edit(&anchor, &new_tokens), 2);
+    }
+
+    #[test]
+    fn remap_resets_to_start_when_anchor_missing_and_index_out_of_range() {
+        let old_tokens = tokens(&["alpha", "beta", "gamma"]);
+        let anchor = build_edit_anchor(&old_tokens, 2).expect("anchor should exist");
+        let new_tokens = tokens(&["one"]);
+        assert_eq!(remap_index_after_edit(&anchor, &new_tokens), 0);
+    }
+
+    #[test]
+    fn remap_uses_nth_occurrence_for_duplicate_tokens() {
+        let old_tokens = tokens(&["a", "b", "a", "c"]);
+        let anchor = build_edit_anchor(&old_tokens, 2).expect("anchor should exist");
+        let new_tokens = tokens(&["a", "a", "c"]);
+        assert_eq!(remap_index_after_edit(&anchor, &new_tokens), 1);
+    }
+
+    #[test]
+    fn remap_prefers_same_position_when_current_word_is_edited() {
+        let old_tokens = tokens(&["alpha", "beta", "gamma", "alpha"]);
+        let anchor = build_edit_anchor(&old_tokens, 0).expect("anchor should exist");
+        let new_tokens = tokens(&["delta", "beta", "gamma", "alpha"]);
+        assert_eq!(remap_index_after_edit(&anchor, &new_tokens), 0);
+    }
+
+    #[test]
+    fn restore_session_keeps_valid_index() {
+        let settings = UserSettings::default();
+        let (_, session) =
+            build_restored_session("one two three", &settings, 2).expect("should restore");
+        assert_eq!(session.current_index, 2);
+        assert!(!session.is_playing);
+    }
+
+    #[test]
+    fn restore_session_resets_out_of_range_index_to_start() {
+        let settings = UserSettings::default();
+        let (_, session) =
+            build_restored_session("one two", &settings, 10).expect("should restore");
+        assert_eq!(session.current_index, 0);
+        assert!(!session.is_playing);
     }
 }
 
