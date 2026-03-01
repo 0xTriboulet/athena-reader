@@ -6,6 +6,8 @@
 //! - Preview and edit extracted text
 //! - Stream words/chunks at a target WPM using an ORP-style centered display
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::env;
 use std::io::Cursor;
 use std::path::PathBuf;
