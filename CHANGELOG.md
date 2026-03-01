@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-03-01
+
+### Fixed
+- Suppress Windows console window in GUI binary by setting the `windows_subsystem = "windows"` attribute
+
 ## [0.2.0] - 2026-02-25
 
 ### Added
