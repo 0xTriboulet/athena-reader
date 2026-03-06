@@ -1307,9 +1307,6 @@ impl eframe::App for AthenaApp {
                 self.live_view_open = false;
                 ctx.send_viewport_cmd_to(live_view_viewport_id, egui::ViewportCommand::Close);
             }
-
-            // Keep repainting while Live View is open so highlights stay in sync.
-            ctx.request_repaint();
         }
     }
 }
