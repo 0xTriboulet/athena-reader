@@ -111,6 +111,7 @@ struct AthenaApp {
     ocr_text: String,
     ocr_editor_open: bool,
     ocr_editor_draft: String,
+    live_view_open: bool,
     session: Option<ReadingSession>,
     model_paths: Option<OcrModelPaths>,
     model_download: OcrModelDownloadConfig,
@@ -168,6 +169,7 @@ impl AthenaApp {
             ocr_text,
             ocr_editor_open: false,
             ocr_editor_draft: String::new(),
+            live_view_open: false,
             session,
             model_paths: default_model_paths(),
             model_download: model_download_config(),
@@ -881,16 +883,147 @@ impl AthenaApp {
 
         action
     }
+
+    /// Opens the Live View window and pauses playback if currently playing.
+    fn open_live_view(&mut self) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.is_playing)
+        {
+            self.pause();
+        }
+        self.live_view_open = true;
+    }
+
+    /// Renders the Live View viewport: read-only flowing text with the current
+    /// word highlighted and smooth auto-scroll to keep it in the top 1/3.
+    ///
+    /// Returns `true` if the user requested to close the window.
+    fn render_live_view(&self, ctx: &egui::Context) -> bool {
+        let mut close_requested = false;
+
+        if ctx.input(|input| input.viewport().close_requested()) {
+            close_requested = true;
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let Some(session) = self.session.as_ref() else {
+                ui.label("No reading session active.");
+                return;
+            };
+
+            let layout = build_highlighted_layout(
+                &session.tokens,
+                session.current_index,
+                session.chunk_size,
+            );
+
+            if layout.is_empty() {
+                ui.label("No tokens to display.");
+                return;
+            }
+
+            let normal_color = ui.visuals().text_color();
+            let highlight_color = match self.settings.theme {
+                Theme::Light => egui::Color32::from_rgb(0, 120, 255),
+                _ => egui::Color32::YELLOW,
+            };
+            let font_size = (self.settings.font_size as f32).clamp(14.0, 72.0);
+            let font_id = egui::FontId::proportional(font_size);
+
+            let mut job = egui::text::LayoutJob {
+                wrap: egui::text::TextWrapping {
+                    max_width: ui.available_width(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            for (i, (token, highlighted)) in layout.iter().enumerate() {
+                if i > 0 {
+                    job.append(
+                        " ",
+                        0.0,
+                        egui::text::TextFormat {
+                            font_id: font_id.clone(),
+                            color: normal_color,
+                            ..Default::default()
+                        },
+                    );
+                }
+                let (color, underline) = if *highlighted {
+                    (highlight_color, egui::Stroke::new(2.0, highlight_color))
+                } else {
+                    (normal_color, egui::Stroke::NONE)
+                };
+                job.append(
+                    token,
+                    0.0,
+                    egui::text::TextFormat {
+                        font_id: font_id.clone(),
+                        color,
+                        underline,
+                        ..Default::default()
+                    },
+                );
+            }
+
+            let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+
+            // Find the Y position of the first highlighted token's row.
+            let highlight_y = find_highlight_y(&galley, &layout);
+            let viewport_height = ui.available_height();
+            let target_offset = compute_scroll_target(highlight_y, viewport_height);
+
+            let scroll_id = ui.id().with("live_view_scroll");
+            let smoothed_offset = ctx.animate_value_with_time(scroll_id, target_offset, 0.3);
+
+            egui::ScrollArea::vertical()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .auto_shrink([false, false])
+                .vertical_scroll_offset(smoothed_offset)
+                .show(ui, |ui| {
+                    ui.label(galley);
+                });
+        });
+
+        close_requested
+    }
+}
+
+/// Finds the Y position of the first highlighted token within the laid-out galley.
+///
+/// Iterates over tokens in `layout`, accumulating character offsets (including
+/// spaces between tokens), until it finds the first highlighted token. Then it
+/// maps that character range to the galley row position.
+fn find_highlight_y(galley: &std::sync::Arc<egui::Galley>, layout: &[(String, bool)]) -> f32 {
+    let mut char_offset: usize = 0;
+    for (i, (token, highlighted)) in layout.iter().enumerate() {
+        if i > 0 {
+            char_offset += 1; // space separator
+        }
+        if *highlighted {
+            let ccursor = egui::text::CCursor::new(char_offset);
+            let rect = galley.pos_from_cursor(ccursor);
+            return rect.top();
+        }
+        char_offset += token.chars().count();
+    }
+    0.0
 }
 
 impl eframe::App for AthenaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let editor_viewport_id = egui::ViewportId::from_hash_of("ocr_editor_viewport");
+        let live_view_viewport_id = egui::ViewportId::from_hash_of("live_view_viewport");
 
-        // If the root viewport is closing, ensure the editor viewport closes too.
+        // If the root viewport is closing, ensure child viewports close too.
         if ctx.input(|input| input.viewport().close_requested()) {
             self.ocr_editor_open = false;
+            self.live_view_open = false;
             ctx.send_viewport_cmd_to(editor_viewport_id, egui::ViewportCommand::Close);
+            ctx.send_viewport_cmd_to(live_view_viewport_id, egui::ViewportCommand::Close);
         }
 
         self.tick(ctx);
@@ -1023,6 +1156,14 @@ impl eframe::App for AthenaApp {
                 ui.horizontal(|ui| {
                     ui.label("Preview:");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if has_session
+                            && ui
+                                .add(egui::Button::new("+").min_size(egui::vec2(24.0, 24.0)))
+                                .on_hover_text("Open Live View")
+                                .clicked()
+                        {
+                            self.open_live_view();
+                        }
                         if let Some(progress) = word_progress.as_deref() {
                             ui.label(progress);
                         }
@@ -1132,6 +1273,43 @@ impl eframe::App for AthenaApp {
                 self.ocr_editor_open = false;
                 ctx.send_viewport_cmd_to(editor_viewport_id, egui::ViewportCommand::Close);
             }
+        }
+
+        if self.live_view_open {
+            let close = ctx.show_viewport_immediate(
+                live_view_viewport_id,
+                egui::ViewportBuilder::default()
+                    .with_title("Live View")
+                    .with_inner_size(egui::vec2(720.0, 540.0))
+                    .with_min_inner_size(egui::vec2(400.0, 300.0))
+                    .with_resizable(true),
+                |ctx, class| match class {
+                    egui::ViewportClass::Embedded => {
+                        let mut close = false;
+                        egui::Window::new("Live View")
+                            .open(&mut self.live_view_open)
+                            .resizable(true)
+                            .default_size(egui::vec2(720.0, 540.0))
+                            .min_size(egui::vec2(400.0, 300.0))
+                            .show(ctx, |_ui| {
+                                // Embedded fallback handled by the window open toggle.
+                            });
+                        if !self.live_view_open {
+                            close = true;
+                        }
+                        close
+                    }
+                    _ => self.render_live_view(ctx),
+                },
+            );
+
+            if close {
+                self.live_view_open = false;
+                ctx.send_viewport_cmd_to(live_view_viewport_id, egui::ViewportCommand::Close);
+            }
+
+            // Keep repainting while Live View is open so highlights stay in sync.
+            ctx.request_repaint();
         }
     }
 }
@@ -1418,6 +1596,150 @@ mod tests {
         assert_eq!(session.current_index, 0);
         assert!(!session.is_playing);
     }
+
+    // ── Live View: build_highlighted_layout tests ───────────────────────
+
+    use super::{build_highlighted_layout, compute_scroll_target};
+
+    #[test]
+    fn highlight_layout_empty_tokens_returns_empty() {
+        let result = build_highlighted_layout(&[], 0, 1);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn highlight_layout_single_token_highlighted() {
+        let toks = tokens(&["hello"]);
+        let result = build_highlighted_layout(&toks, 0, 1);
+        assert_eq!(result, vec![("hello".to_string(), true)]);
+    }
+
+    #[test]
+    fn highlight_layout_mid_stream() {
+        let toks = tokens(&["one", "two", "three", "four"]);
+        let result = build_highlighted_layout(&toks, 1, 1);
+        assert_eq!(
+            result,
+            vec![
+                ("one".to_string(), false),
+                ("two".to_string(), true),
+                ("three".to_string(), false),
+                ("four".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_layout_end_of_stream() {
+        let toks = tokens(&["alpha", "beta", "gamma"]);
+        let result = build_highlighted_layout(&toks, 2, 1);
+        assert_eq!(
+            result,
+            vec![
+                ("alpha".to_string(), false),
+                ("beta".to_string(), false),
+                ("gamma".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_layout_chunk_size_greater_than_one() {
+        let toks = tokens(&["a", "b", "c", "d", "e"]);
+        let result = build_highlighted_layout(&toks, 1, 3);
+        assert_eq!(
+            result,
+            vec![
+                ("a".to_string(), false),
+                ("b".to_string(), true),
+                ("c".to_string(), true),
+                ("d".to_string(), true),
+                ("e".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_layout_chunk_clamps_at_end() {
+        let toks = tokens(&["x", "y", "z"]);
+        let result = build_highlighted_layout(&toks, 2, 3);
+        assert_eq!(
+            result,
+            vec![
+                ("x".to_string(), false),
+                ("y".to_string(), false),
+                ("z".to_string(), true),
+            ]
+        );
+    }
+
+    // ── Live View: compute_scroll_target tests ──────────────────────────
+
+    #[test]
+    fn scroll_target_highlight_near_top() {
+        // highlight_y = 10, viewport = 600 → target = 10 - 200 = -190 → clamped to 0
+        assert_eq!(compute_scroll_target(10.0, 600.0), 0.0);
+    }
+
+    #[test]
+    fn scroll_target_highlight_in_middle() {
+        // highlight_y = 500, viewport = 600 → target = 500 - 200 = 300
+        assert_eq!(compute_scroll_target(500.0, 600.0), 300.0);
+    }
+
+    #[test]
+    fn scroll_target_highlight_near_bottom() {
+        // highlight_y = 1800, viewport = 600 → target = 1800 - 200 = 1600
+        assert_eq!(compute_scroll_target(1800.0, 600.0), 1600.0);
+    }
+
+    #[test]
+    fn scroll_target_zero_viewport_height() {
+        // Zero viewport → should not go negative; returns max(0, highlight_y)
+        assert_eq!(compute_scroll_target(100.0, 0.0), 100.0);
+    }
+}
+
+/// Builds a list of `(token_text, is_highlighted)` pairs for the Live View.
+///
+/// Each token in `tokens` is paired with a boolean indicating whether it falls
+/// within the currently-displayed chunk starting at `current_index` with the
+/// given `chunk_size`. Tokens are separated by spaces in the output to produce
+/// flowing text.
+fn build_highlighted_layout(
+    tokens: &[String],
+    current_index: usize,
+    chunk_size: usize,
+) -> Vec<(String, bool)> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let highlight_end = (current_index + chunk_size).min(tokens.len());
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, token)| {
+            let highlighted = i >= current_index && i < highlight_end;
+            (token.clone(), highlighted)
+        })
+        .collect()
+}
+
+/// Computes the scroll offset that places the highlighted element in the top
+/// one-third of the viewport.
+///
+/// - `highlight_y`: the Y-position of the highlighted word within the full
+///   content area.
+/// - `viewport_height`: the visible height of the scroll area.
+///
+/// Returns the scroll offset (clamped to >= 0.0) such that the highlight
+/// appears at roughly the 1/3 mark from the top.
+fn compute_scroll_target(highlight_y: f32, viewport_height: f32) -> f32 {
+    if viewport_height <= 0.0 {
+        return 0.0_f32.max(highlight_y);
+    }
+    let target_offset = highlight_y - viewport_height / 3.0;
+    target_offset.max(0.0)
 }
 
 /// GUI entry point.

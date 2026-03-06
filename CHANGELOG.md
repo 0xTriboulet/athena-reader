@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-03-06
+
+### Added
+- Live View window: "+" button at bottom-right of preview panel opens a separate OS window with read-only flowing text and the currently-streaming word highlighted
+- Smooth auto-scroll in Live View keeps the highlighted word in the top 1/3 of the viewport
+- Opening Live View pauses playback if currently playing
+- 10 new unit tests covering highlight layout building and scroll-target calculation
+
 ## [0.2.1] - 2026-03-01
 
 ### Fixed

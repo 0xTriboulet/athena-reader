@@ -6,6 +6,7 @@ Athena Reader is a native desktop speed-reading tool that lets a user paste or i
 ## Progress
 _Historical implementation log; older entries may describe superseded intermediate decisions._
 
+- 2026-03-06: Added Live View feature: a "+" button in the preview panel opens a separate OS window showing all tokens as flowing text with the current streaming word highlighted (theme-aware color + underline). The viewport smoothly auto-scrolls to keep the highlight in the top 1/3. Opening Live View pauses playback. TDD approach with 10 new unit tests. Tests run: `cargo fmt`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.
 - 2026-02-25: Added unified clipboard paste support for text and images in the app control flow. The Paste control now prefers clipboard text when both text and image are present, and falls back to image OCR otherwise. Tests run: `cargo fmt`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.
 - 2026-02-25: Improved editor-save position behavior: opening the editor from preview pauses playback, and Save remaps to the closest logical reading position in edited text (with fallback to index 0 when out of range). Tests run: `cargo fmt`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.
 - 2026-02-25: Documentation completeness/readability pass for README and specification to align with current implementation details (import matrix, editor semantics, persistence semantics, constraints). Tests run: not required (docs-only updates).
@@ -111,12 +112,21 @@ _Historical implementation log; older entries may describe superseded intermedia
 - Reading Mode (word display, controls, progress).
 - Error State (clipboard missing usable content, OCR failure, empty text).
 - Edit Text Window (separate OS window; scrollable + editable full text; Save/Cancel).
+- Live View Window (separate OS window; read-only flowing text with highlighted current word and smooth auto-scroll).
 
 ### 6.5.1 Edit Text behavior
 - Opening Edit Text from preview captures reading context (current token + neighbors) for position remapping.
 - If playback is running when editor is opened, playback pauses immediately.
 - Saving editor text rebuilds the reading session in paused mode.
 - Position remapping prefers the original logical position using token occurrence and surrounding context; if no valid position exists, reset to index 0.
+
+### 6.5.2 Live View behavior
+- A "+" button in the bottom-right of the preview header opens the Live View window.
+- Opening the Live View pauses playback if currently playing.
+- The Live View renders all tokens as flowing text with the current word (or chunk) highlighted using theme-aware color and underline.
+- The viewport smoothly auto-scrolls to keep the highlighted word in the top one-third of the visible area.
+- The Live View is read-only; edits must use the Edit Text window.
+- Closing the Live View (via window close button) does not change playback state.
 
 ### 6.6 Settings and Persistence
 - Persist WPM, chunk size, font size, and theme locally (app config file).
