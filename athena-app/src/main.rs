@@ -134,8 +134,8 @@ struct LiveViewShared {
     chunk_size: usize,
     /// UI theme for highlight color selection.
     theme: Theme,
-    /// Font size for text rendering.
-    font_size: u32,
+    /// Font size for text rendering (controlled by the Live View slider).
+    font_size: f32,
     /// Set by the deferred callback when the user closes the Live View window.
     close_requested: bool,
 }
@@ -147,7 +147,7 @@ impl Default for LiveViewShared {
             current_index: 0,
             chunk_size: 1,
             theme: Theme::Dark,
-            font_size: 32,
+            font_size: 32.0,
             close_requested: false,
         }
     }
@@ -948,9 +948,10 @@ impl AthenaApp {
         {
             self.pause();
         }
-        // Reset close flag so the deferred callback starts clean.
+        // Reset close flag and seed font size from app settings.
         if let Ok(mut shared) = self.live_view_shared.lock() {
             shared.close_requested = false;
+            shared.font_size = self.settings.font_size as f32;
         }
         self.live_view_open = true;
     }
@@ -975,7 +976,7 @@ impl AthenaApp {
             shared.current_index = session.current_index;
             shared.chunk_size = session.chunk_size;
             shared.theme = self.settings.theme.clone();
-            shared.font_size = self.settings.font_size;
+            // font_size is controlled by the Live View slider, not overwritten here.
         } else {
             shared.text_data = None;
         }
@@ -1748,7 +1749,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
     }
 
     // Read the snapshot under a short lock, then drop it before rendering.
-    let (text_data, current_index, chunk_size, theme, font_size) = {
+    let (text_data, current_index, chunk_size, theme, mut font_size) = {
         let Ok(state) = shared.lock() else {
             return;
         };
@@ -1778,6 +1779,19 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         return;
     }
 
+    // Bottom panel with the font size slider.
+    egui::TopBottomPanel::bottom("live_view_controls").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Font size:");
+            ui.add(egui::Slider::new(&mut font_size, 10.0..=80.0).suffix("px"));
+        });
+    });
+
+    // Write the (possibly updated) font size back to shared state.
+    if let Ok(mut state) = shared.lock() {
+        state.font_size = font_size;
+    }
+
     egui::CentralPanel::default().show(ctx, |ui| {
         let num_tokens = text_data.token_byte_starts.len();
         let current = current_index.min(num_tokens.saturating_sub(1));
@@ -1788,7 +1802,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
             Theme::Light => egui::Color32::from_rgb(0, 120, 255),
             _ => egui::Color32::YELLOW,
         };
-        let clamped_font_size = (font_size as f32).clamp(14.0, 72.0);
+        let clamped_font_size = font_size.clamp(10.0, 80.0);
         let font_id = egui::FontId::proportional(clamped_font_size);
 
         let normal_fmt = egui::text::TextFormat {
