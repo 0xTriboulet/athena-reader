@@ -13,6 +13,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,54 @@ struct EditAnchor {
     next_token: Option<String>,
 }
 
+/// Pre-computed text and token-offset tables for the Live View.
+///
+/// Rebuilt only when the session tokens change (new import, editor save, etc.),
+/// NOT every frame. Stored behind an `Arc` so the deferred viewport callback
+/// can reference it without cloning the text.
+struct LiveViewTextData {
+    /// Full text with space-separated tokens.
+    full_text: String,
+    /// Byte offset of each token's start in `full_text`.
+    token_byte_starts: Vec<usize>,
+    /// Byte offset just past each token's end in `full_text`.
+    token_byte_ends: Vec<usize>,
+    /// Character offset of each token's start in `full_text`.
+    token_char_starts: Vec<usize>,
+}
+
+/// Shared state between the parent frame and the deferred Live View viewport.
+///
+/// The parent writes the latest session/settings snapshot each frame; the
+/// deferred viewport callback reads it to render.
+struct LiveViewShared {
+    /// Pre-computed text data (rebuilt when tokens change).
+    text_data: Option<Arc<LiveViewTextData>>,
+    /// Current highlight start token index.
+    current_index: usize,
+    /// Number of tokens to highlight.
+    chunk_size: usize,
+    /// UI theme for highlight color selection.
+    theme: Theme,
+    /// Font size for text rendering.
+    font_size: u32,
+    /// Set by the deferred callback when the user closes the Live View window.
+    close_requested: bool,
+}
+
+impl Default for LiveViewShared {
+    fn default() -> Self {
+        Self {
+            text_data: None,
+            current_index: 0,
+            chunk_size: 1,
+            theme: Theme::Dark,
+            font_size: 32,
+            close_requested: false,
+        }
+    }
+}
+
 /// Top-level egui application state for Athena Reader.
 struct AthenaApp {
     ui_state: UiState,
@@ -112,6 +161,10 @@ struct AthenaApp {
     ocr_editor_open: bool,
     ocr_editor_draft: String,
     live_view_open: bool,
+    /// Shared state for the deferred Live View viewport.
+    live_view_shared: Arc<Mutex<LiveViewShared>>,
+    /// Raw text from which the current `LiveViewTextData` was built (change detection).
+    live_view_text_source: String,
     session: Option<ReadingSession>,
     model_paths: Option<OcrModelPaths>,
     model_download: OcrModelDownloadConfig,
@@ -170,6 +223,8 @@ impl AthenaApp {
             ocr_editor_open: false,
             ocr_editor_draft: String::new(),
             live_view_open: false,
+            live_view_shared: Arc::new(Mutex::new(LiveViewShared::default())),
+            live_view_text_source: String::new(),
             session,
             model_paths: default_model_paths(),
             model_download: model_download_config(),
@@ -893,138 +948,37 @@ impl AthenaApp {
         {
             self.pause();
         }
+        // Reset close flag so the deferred callback starts clean.
+        if let Ok(mut shared) = self.live_view_shared.lock() {
+            shared.close_requested = false;
+        }
         self.live_view_open = true;
     }
 
-    /// Renders the Live View viewport: read-only flowing text with the current
-    /// word highlighted and smooth auto-scroll to keep it in the top 1/3.
+    /// Updates the shared Live View state from the current session and settings.
     ///
-    /// Builds the full text in a single pass and creates only 1–3 `LayoutSection`s
-    /// (before-highlight, highlight, after-highlight) to keep the layout cost
-    /// proportional to character count rather than token count.
-    ///
-    /// Returns `true` if the user requested to close the window.
-    fn render_live_view(&self, ctx: &egui::Context) -> bool {
-        let mut close_requested = false;
+    /// Called every frame while the Live View is open. Rebuilds the pre-computed
+    /// text data only when the underlying tokens change (detected by comparing
+    /// `raw_text`). The per-frame cost is O(1) for highlight/settings updates.
+    fn sync_live_view_shared(&mut self) {
+        let Ok(mut shared) = self.live_view_shared.lock() else {
+            return;
+        };
 
-        if ctx.input(|input| input.viewport().close_requested()) {
-            close_requested = true;
+        if let Some(session) = self.session.as_ref() {
+            // Rebuild text data only when the token source changes.
+            if self.live_view_text_source != session.raw_text {
+                self.live_view_text_source = session.raw_text.clone();
+                shared.text_data = Some(Arc::new(build_live_view_text_data(&session.tokens)));
+            }
+
+            shared.current_index = session.current_index;
+            shared.chunk_size = session.chunk_size;
+            shared.theme = self.settings.theme.clone();
+            shared.font_size = self.settings.font_size;
+        } else {
+            shared.text_data = None;
         }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(session) = self.session.as_ref() else {
-                ui.label("No reading session active.");
-                return;
-            };
-
-            let tokens = &session.tokens;
-            if tokens.is_empty() {
-                ui.label("No tokens to display.");
-                return;
-            }
-
-            let current = session.current_index.min(tokens.len().saturating_sub(1));
-            let highlight_end = (current + session.chunk_size).min(tokens.len());
-
-            let normal_color = ui.visuals().text_color();
-            let highlight_color = match self.settings.theme {
-                Theme::Light => egui::Color32::from_rgb(0, 120, 255),
-                _ => egui::Color32::YELLOW,
-            };
-            let font_size = (self.settings.font_size as f32).clamp(14.0, 72.0);
-            let font_id = egui::FontId::proportional(font_size);
-
-            let normal_fmt = egui::text::TextFormat {
-                font_id: font_id.clone(),
-                color: normal_color,
-                ..Default::default()
-            };
-            let highlight_fmt = egui::text::TextFormat {
-                font_id,
-                color: highlight_color,
-                underline: egui::Stroke::new(2.0, highlight_color),
-                ..Default::default()
-            };
-
-            // Single pass: build full text and record highlight byte/char offsets.
-            let estimated_len: usize =
-                tokens.iter().map(|t| t.len()).sum::<usize>() + tokens.len().saturating_sub(1);
-            let mut full_text = String::with_capacity(estimated_len);
-            let mut highlight_byte_start = 0usize;
-            let mut highlight_byte_end = 0usize;
-            let mut highlight_char_start = 0usize;
-            let mut char_count = 0usize;
-
-            for (i, token) in tokens.iter().enumerate() {
-                if i > 0 {
-                    full_text.push(' ');
-                    char_count += 1;
-                }
-                if i == current {
-                    highlight_byte_start = full_text.len();
-                    highlight_char_start = char_count;
-                }
-                full_text.push_str(token);
-                char_count += token.chars().count();
-                if i + 1 == highlight_end {
-                    highlight_byte_end = full_text.len();
-                }
-            }
-
-            // Build 1–3 LayoutSections instead of 2N.
-            let mut sections = Vec::with_capacity(3);
-            if highlight_byte_start > 0 {
-                sections.push(egui::text::LayoutSection {
-                    leading_space: 0.0,
-                    byte_range: 0..highlight_byte_start,
-                    format: normal_fmt.clone(),
-                });
-            }
-            sections.push(egui::text::LayoutSection {
-                leading_space: 0.0,
-                byte_range: highlight_byte_start..highlight_byte_end,
-                format: highlight_fmt,
-            });
-            if highlight_byte_end < full_text.len() {
-                sections.push(egui::text::LayoutSection {
-                    leading_space: 0.0,
-                    byte_range: highlight_byte_end..full_text.len(),
-                    format: normal_fmt,
-                });
-            }
-
-            let job = egui::text::LayoutJob {
-                text: full_text,
-                sections,
-                wrap: egui::text::TextWrapping {
-                    max_width: ui.available_width(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
-
-            let highlight_y = galley
-                .pos_from_cursor(egui::text::CCursor::new(highlight_char_start))
-                .top();
-
-            let viewport_height = ui.available_height();
-            let target_offset = compute_scroll_target(highlight_y, viewport_height);
-
-            let scroll_id = ui.id().with("live_view_scroll");
-            let smoothed_offset = ctx.animate_value_with_time(scroll_id, target_offset, 0.3);
-
-            egui::ScrollArea::vertical()
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-                .auto_shrink([false, false])
-                .vertical_scroll_offset(smoothed_offset)
-                .show(ui, |ui| {
-                    ui.label(galley);
-                });
-        });
-
-        close_requested
     }
 }
 
@@ -1291,37 +1245,35 @@ impl eframe::App for AthenaApp {
         }
 
         if self.live_view_open {
-            let close = ctx.show_viewport_immediate(
+            // Check if the deferred callback signaled a close.
+            if self
+                .live_view_shared
+                .lock()
+                .is_ok_and(|s| s.close_requested)
+            {
+                self.live_view_open = false;
+                ctx.send_viewport_cmd_to(live_view_viewport_id, egui::ViewportCommand::Close);
+            }
+        }
+
+        if self.live_view_open {
+            self.sync_live_view_shared();
+
+            let shared = Arc::clone(&self.live_view_shared);
+            ctx.show_viewport_deferred(
                 live_view_viewport_id,
                 egui::ViewportBuilder::default()
                     .with_title("Live View")
                     .with_inner_size(egui::vec2(720.0, 540.0))
                     .with_min_inner_size(egui::vec2(400.0, 300.0))
                     .with_resizable(true),
-                |ctx, class| match class {
-                    egui::ViewportClass::Embedded => {
-                        let mut close = false;
-                        egui::Window::new("Live View")
-                            .open(&mut self.live_view_open)
-                            .resizable(true)
-                            .default_size(egui::vec2(720.0, 540.0))
-                            .min_size(egui::vec2(400.0, 300.0))
-                            .show(ctx, |_ui| {
-                                // Embedded fallback handled by the window open toggle.
-                            });
-                        if !self.live_view_open {
-                            close = true;
-                        }
-                        close
-                    }
-                    _ => self.render_live_view(ctx),
+                move |ctx, _class| {
+                    render_live_view_deferred(ctx, &shared);
                 },
             );
 
-            if close {
-                self.live_view_open = false;
-                ctx.send_viewport_cmd_to(live_view_viewport_id, egui::ViewportCommand::Close);
-            }
+            // Nudge the child viewport to repaint when session data changes.
+            ctx.request_repaint_of(live_view_viewport_id);
         }
     }
 }
@@ -1747,6 +1699,171 @@ fn compute_scroll_target(highlight_y: f32, viewport_height: f32) -> f32 {
     }
     let target_offset = highlight_y - viewport_height / 3.0;
     target_offset.max(0.0)
+}
+
+/// Builds the pre-computed text and offset tables from session tokens.
+///
+/// Called once when the session tokens change, not every frame.
+fn build_live_view_text_data(tokens: &[String]) -> LiveViewTextData {
+    let estimated_len: usize =
+        tokens.iter().map(|t| t.len()).sum::<usize>() + tokens.len().saturating_sub(1);
+    let mut full_text = String::with_capacity(estimated_len);
+    let mut token_byte_starts = Vec::with_capacity(tokens.len());
+    let mut token_byte_ends = Vec::with_capacity(tokens.len());
+    let mut token_char_starts = Vec::with_capacity(tokens.len());
+    let mut char_count = 0usize;
+
+    for (i, token) in tokens.iter().enumerate() {
+        if i > 0 {
+            full_text.push(' ');
+            char_count += 1;
+        }
+        token_byte_starts.push(full_text.len());
+        token_char_starts.push(char_count);
+        full_text.push_str(token);
+        char_count += token.chars().count();
+        token_byte_ends.push(full_text.len());
+    }
+
+    LiveViewTextData {
+        full_text,
+        token_byte_starts,
+        token_byte_ends,
+        token_char_starts,
+    }
+}
+
+/// Deferred rendering callback for the Live View viewport.
+///
+/// Reads the shared state snapshot, builds a `LayoutJob` with 1–3 sections,
+/// and renders the flowing text with the highlighted word and smooth
+/// auto-scroll. Runs in the child viewport's context, decoupled from the
+/// parent event loop.
+fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewShared>>) {
+    if ctx.input(|input| input.viewport().close_requested()) {
+        if let Ok(mut state) = shared.lock() {
+            state.close_requested = true;
+        }
+        return;
+    }
+
+    // Read the snapshot under a short lock, then drop it before rendering.
+    let (text_data, current_index, chunk_size, theme, font_size) = {
+        let Ok(state) = shared.lock() else {
+            return;
+        };
+        let text_data = match state.text_data.as_ref() {
+            Some(td) => Arc::clone(td),
+            None => {
+                drop(state);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("No reading session active.");
+                });
+                return;
+            }
+        };
+        (
+            text_data,
+            state.current_index,
+            state.chunk_size,
+            state.theme.clone(),
+            state.font_size,
+        )
+    };
+
+    if text_data.full_text.is_empty() || text_data.token_byte_starts.is_empty() {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.label("No tokens to display.");
+        });
+        return;
+    }
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        let num_tokens = text_data.token_byte_starts.len();
+        let current = current_index.min(num_tokens.saturating_sub(1));
+        let highlight_end = (current + chunk_size).min(num_tokens);
+
+        let normal_color = ui.visuals().text_color();
+        let highlight_color = match theme {
+            Theme::Light => egui::Color32::from_rgb(0, 120, 255),
+            _ => egui::Color32::YELLOW,
+        };
+        let clamped_font_size = (font_size as f32).clamp(14.0, 72.0);
+        let font_id = egui::FontId::proportional(clamped_font_size);
+
+        let normal_fmt = egui::text::TextFormat {
+            font_id: font_id.clone(),
+            color: normal_color,
+            ..Default::default()
+        };
+        let highlight_fmt = egui::text::TextFormat {
+            font_id,
+            color: highlight_color,
+            underline: egui::Stroke::new(2.0, highlight_color),
+            ..Default::default()
+        };
+
+        // O(1) lookups into the pre-computed offset tables.
+        let hl_byte_start = text_data.token_byte_starts[current];
+        let hl_byte_end = if highlight_end > 0 {
+            text_data.token_byte_ends[highlight_end - 1]
+        } else {
+            hl_byte_start
+        };
+        let hl_char_start = text_data.token_char_starts[current];
+
+        // Build 1–3 LayoutSections.
+        let mut sections = Vec::with_capacity(3);
+        if hl_byte_start > 0 {
+            sections.push(egui::text::LayoutSection {
+                leading_space: 0.0,
+                byte_range: 0..hl_byte_start,
+                format: normal_fmt.clone(),
+            });
+        }
+        sections.push(egui::text::LayoutSection {
+            leading_space: 0.0,
+            byte_range: hl_byte_start..hl_byte_end,
+            format: highlight_fmt,
+        });
+        if hl_byte_end < text_data.full_text.len() {
+            sections.push(egui::text::LayoutSection {
+                leading_space: 0.0,
+                byte_range: hl_byte_end..text_data.full_text.len(),
+                format: normal_fmt,
+            });
+        }
+
+        let job = egui::text::LayoutJob {
+            text: text_data.full_text.clone(),
+            sections,
+            wrap: egui::text::TextWrapping {
+                max_width: ui.available_width(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+
+        let highlight_y = galley
+            .pos_from_cursor(egui::text::CCursor::new(hl_char_start))
+            .top();
+
+        let viewport_height = ui.available_height();
+        let target_offset = compute_scroll_target(highlight_y, viewport_height);
+
+        let scroll_id = ui.id().with("live_view_scroll");
+        let smoothed_offset = ctx.animate_value_with_time(scroll_id, target_offset, 0.3);
+
+        egui::ScrollArea::vertical()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .auto_shrink([false, false])
+            .vertical_scroll_offset(smoothed_offset)
+            .show(ui, |ui| {
+                ui.label(galley);
+            });
+    });
 }
 
 /// GUI entry point.
