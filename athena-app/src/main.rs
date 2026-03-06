@@ -899,6 +899,10 @@ impl AthenaApp {
     /// Renders the Live View viewport: read-only flowing text with the current
     /// word highlighted and smooth auto-scroll to keep it in the top 1/3.
     ///
+    /// Builds the full text in a single pass and creates only 1–3 `LayoutSection`s
+    /// (before-highlight, highlight, after-highlight) to keep the layout cost
+    /// proportional to character count rather than token count.
+    ///
     /// Returns `true` if the user requested to close the window.
     fn render_live_view(&self, ctx: &egui::Context) -> bool {
         let mut close_requested = false;
@@ -913,16 +917,14 @@ impl AthenaApp {
                 return;
             };
 
-            let layout = build_highlighted_layout(
-                &session.tokens,
-                session.current_index,
-                session.chunk_size,
-            );
-
-            if layout.is_empty() {
+            let tokens = &session.tokens;
+            if tokens.is_empty() {
                 ui.label("No tokens to display.");
                 return;
             }
+
+            let current = session.current_index.min(tokens.len().saturating_sub(1));
+            let highlight_end = (current + session.chunk_size).min(tokens.len());
 
             let normal_color = ui.visuals().text_color();
             let highlight_color = match self.settings.theme {
@@ -932,7 +934,68 @@ impl AthenaApp {
             let font_size = (self.settings.font_size as f32).clamp(14.0, 72.0);
             let font_id = egui::FontId::proportional(font_size);
 
-            let mut job = egui::text::LayoutJob {
+            let normal_fmt = egui::text::TextFormat {
+                font_id: font_id.clone(),
+                color: normal_color,
+                ..Default::default()
+            };
+            let highlight_fmt = egui::text::TextFormat {
+                font_id,
+                color: highlight_color,
+                underline: egui::Stroke::new(2.0, highlight_color),
+                ..Default::default()
+            };
+
+            // Single pass: build full text and record highlight byte/char offsets.
+            let estimated_len: usize =
+                tokens.iter().map(|t| t.len()).sum::<usize>() + tokens.len().saturating_sub(1);
+            let mut full_text = String::with_capacity(estimated_len);
+            let mut highlight_byte_start = 0usize;
+            let mut highlight_byte_end = 0usize;
+            let mut highlight_char_start = 0usize;
+            let mut char_count = 0usize;
+
+            for (i, token) in tokens.iter().enumerate() {
+                if i > 0 {
+                    full_text.push(' ');
+                    char_count += 1;
+                }
+                if i == current {
+                    highlight_byte_start = full_text.len();
+                    highlight_char_start = char_count;
+                }
+                full_text.push_str(token);
+                char_count += token.chars().count();
+                if i + 1 == highlight_end {
+                    highlight_byte_end = full_text.len();
+                }
+            }
+
+            // Build 1–3 LayoutSections instead of 2N.
+            let mut sections = Vec::with_capacity(3);
+            if highlight_byte_start > 0 {
+                sections.push(egui::text::LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: 0..highlight_byte_start,
+                    format: normal_fmt.clone(),
+                });
+            }
+            sections.push(egui::text::LayoutSection {
+                leading_space: 0.0,
+                byte_range: highlight_byte_start..highlight_byte_end,
+                format: highlight_fmt,
+            });
+            if highlight_byte_end < full_text.len() {
+                sections.push(egui::text::LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: highlight_byte_end..full_text.len(),
+                    format: normal_fmt,
+                });
+            }
+
+            let job = egui::text::LayoutJob {
+                text: full_text,
+                sections,
                 wrap: egui::text::TextWrapping {
                     max_width: ui.available_width(),
                     ..Default::default()
@@ -940,39 +1003,12 @@ impl AthenaApp {
                 ..Default::default()
             };
 
-            for (i, (token, highlighted)) in layout.iter().enumerate() {
-                if i > 0 {
-                    job.append(
-                        " ",
-                        0.0,
-                        egui::text::TextFormat {
-                            font_id: font_id.clone(),
-                            color: normal_color,
-                            ..Default::default()
-                        },
-                    );
-                }
-                let (color, underline) = if *highlighted {
-                    (highlight_color, egui::Stroke::new(2.0, highlight_color))
-                } else {
-                    (normal_color, egui::Stroke::NONE)
-                };
-                job.append(
-                    token,
-                    0.0,
-                    egui::text::TextFormat {
-                        font_id: font_id.clone(),
-                        color,
-                        underline,
-                        ..Default::default()
-                    },
-                );
-            }
-
             let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
 
-            // Find the Y position of the first highlighted token's row.
-            let highlight_y = find_highlight_y(&galley, &layout);
+            let highlight_y = galley
+                .pos_from_cursor(egui::text::CCursor::new(highlight_char_start))
+                .top();
+
             let viewport_height = ui.available_height();
             let target_offset = compute_scroll_target(highlight_y, viewport_height);
 
@@ -990,27 +1026,6 @@ impl AthenaApp {
 
         close_requested
     }
-}
-
-/// Finds the Y position of the first highlighted token within the laid-out galley.
-///
-/// Iterates over tokens in `layout`, accumulating character offsets (including
-/// spaces between tokens), until it finds the first highlighted token. Then it
-/// maps that character range to the galley row position.
-fn find_highlight_y(galley: &std::sync::Arc<egui::Galley>, layout: &[(String, bool)]) -> f32 {
-    let mut char_offset: usize = 0;
-    for (i, (token, highlighted)) in layout.iter().enumerate() {
-        if i > 0 {
-            char_offset += 1; // space separator
-        }
-        if *highlighted {
-            let ccursor = egui::text::CCursor::new(char_offset);
-            let rect = galley.pos_from_cursor(ccursor);
-            return rect.top();
-        }
-        char_offset += token.chars().count();
-    }
-    0.0
 }
 
 impl eframe::App for AthenaApp {
@@ -1596,7 +1611,27 @@ mod tests {
 
     // ── Live View: build_highlighted_layout tests ───────────────────────
 
-    use super::{build_highlighted_layout, compute_scroll_target};
+    use super::compute_scroll_target;
+
+    /// Test-only helper: builds a list of `(token_text, is_highlighted)` pairs.
+    fn build_highlighted_layout(
+        tokens: &[String],
+        current_index: usize,
+        chunk_size: usize,
+    ) -> Vec<(String, bool)> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let highlight_end = (current_index + chunk_size).min(tokens.len());
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(i, token)| {
+                let highlighted = i >= current_index && i < highlight_end;
+                (token.clone(), highlighted)
+            })
+            .collect()
+    }
 
     #[test]
     fn highlight_layout_empty_tokens_returns_empty() {
@@ -1695,31 +1730,6 @@ mod tests {
         // Zero viewport → should not go negative; returns max(0, highlight_y)
         assert_eq!(compute_scroll_target(100.0, 0.0), 100.0);
     }
-}
-
-/// Builds a list of `(token_text, is_highlighted)` pairs for the Live View.
-///
-/// Each token in `tokens` is paired with a boolean indicating whether it falls
-/// within the currently-displayed chunk starting at `current_index` with the
-/// given `chunk_size`. Tokens are separated by spaces in the output to produce
-/// flowing text.
-fn build_highlighted_layout(
-    tokens: &[String],
-    current_index: usize,
-    chunk_size: usize,
-) -> Vec<(String, bool)> {
-    if tokens.is_empty() {
-        return Vec::new();
-    }
-    let highlight_end = (current_index + chunk_size).min(tokens.len());
-    tokens
-        .iter()
-        .enumerate()
-        .map(|(i, token)| {
-            let highlighted = i >= current_index && i < highlight_end;
-            (token.clone(), highlighted)
-        })
-        .collect()
 }
 
 /// Computes the scroll offset that places the highlighted element in the top
