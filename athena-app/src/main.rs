@@ -37,36 +37,48 @@ use athena_core::settings::{
 // stalling the shared winit event loop and freezing the parent window.
 //
 // Setting the swap interval to 0 makes `eglSwapBuffers` non-blocking.
-// We look up the EGL symbols at runtime via `dlsym(RTLD_DEFAULT, …)` —
-// glutin has already loaded libEGL.so by the time we call this, so the
-// symbols are present in the process without any additional link-time
-// dependency.
+// We load libEGL.so explicitly via `dlopen` and look up the symbols with
+// `dlsym` on that handle.  glutin loads libEGL with `RTLD_LOCAL`, which
+// means the symbols are NOT visible to `dlsym(RTLD_DEFAULT, …)` — we
+// must open the library by name to get a handle that exposes them.
 
 /// Attempts to set the EGL swap interval to 0 for the surface currently
 /// bound to the calling thread's GL context.
 ///
-/// Uses `dlsym(RTLD_DEFAULT, …)` to locate `eglGetCurrentDisplay` and
-/// `eglSwapInterval` in the already-loaded libEGL.so (loaded by glutin).
+/// Opens `libEGL.so.1` (already loaded by glutin) via `dlopen` and looks
+/// up `eglGetCurrentDisplay` and `eglSwapInterval` from that handle.
 /// Returns `true` if the call succeeded.  On non-Linux platforms, or when
-/// the EGL symbols are not available, this is a no-op that returns `false`.
+/// the EGL library/symbols are not available, this is a no-op returning
+/// `false`.
 #[cfg(target_os = "linux")]
 fn try_set_egl_swap_interval_zero() -> bool {
     use std::ffi::c_void;
 
-    // `dlsym` is provided by libdl, which is already linked (-ldl).
+    // `dlopen` / `dlsym` are provided by libdl, which is already linked.
     unsafe extern "C" {
+        unsafe fn dlopen(filename: *const i8, flags: i32) -> *mut c_void;
         unsafe fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
     }
 
-    // glibc defines RTLD_DEFAULT as ((void *)0).
-    const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
+    const RTLD_LAZY: i32 = 1;
 
-    // SAFETY: We transmute raw dlsym pointers into typed fn pointers whose
-    // signatures match the EGL 1.0 spec.  The symbols are guaranteed to be
-    // loaded by glutin/eframe before any child viewport renders.
+    // SAFETY: We open the already-loaded libEGL.so.1 (glutin loaded it via
+    // libloading with RTLD_LOCAL, so RTLD_DEFAULT can't see its symbols).
+    // dlopen with the same filename returns the existing handle with an
+    // incremented refcount — safe and lightweight.  We then transmute the
+    // raw symbol pointers into typed fn pointers matching the EGL 1.0 spec.
     unsafe {
-        let p_get_display = dlsym(RTLD_DEFAULT, c"eglGetCurrentDisplay".as_ptr().cast::<i8>());
-        let p_swap_interval = dlsym(RTLD_DEFAULT, c"eglSwapInterval".as_ptr().cast::<i8>());
+        // Try the versioned soname first, then unversioned.
+        let mut handle = dlopen(c"libEGL.so.1".as_ptr().cast::<i8>(), RTLD_LAZY);
+        if handle.is_null() {
+            handle = dlopen(c"libEGL.so".as_ptr().cast::<i8>(), RTLD_LAZY);
+        }
+        if handle.is_null() {
+            return false;
+        }
+
+        let p_get_display = dlsym(handle, c"eglGetCurrentDisplay".as_ptr().cast::<i8>());
+        let p_swap_interval = dlsym(handle, c"eglSwapInterval".as_ptr().cast::<i8>());
         if p_get_display.is_null() || p_swap_interval.is_null() {
             return false;
         }
@@ -1377,31 +1389,22 @@ impl eframe::App for AthenaApp {
             // actually changed (stream advance, theme switch, etc.) or when
             // the Live View was just opened.
             //
-            // Two guards prevent `request_repaint_of` from reaching a child
-            // whose `eglSwapBuffers` would block the shared event loop:
+            // Stale-child guard: if the child hasn't rendered in >1 s it is
+            // likely blocked on swap-buffers (e.g. minimized on a compositor
+            // where eglSwapInterval(0) wasn't honored).  Stop flooding it
+            // with requests so the event loop stays responsive.
             //
-            // 1. **Focus guard** – on Wayland the compositor sends
-            //    `wl_keyboard.leave` before minimizing a surface, so
-            //    `child_focused == Some(false)` is a reliable proxy.
-            //    We skip repaints in that state.  When the Live View is
-            //    unfocused but *visible* (user clicked the main window),
-            //    OS events (mouse hover, etc.) still trigger child renders
-            //    that pick up the latest shared state on demand.
-            //
-            // 2. **Stale-child guard** – if the child hasn't rendered in
-            //    >1 s it may be blocked on swap-buffers.  Stop flooding it.
+            // No focus gate: with eglSwapInterval(0) properly set via dlopen
+            // (not RTLD_DEFAULT), swap_buffers is non-blocking even for
+            // minimized surfaces, so background-visible children must keep
+            // receiving repaints to track the word stream in real time.
             let needs_repaint = data_changed || self.live_view_needs_initial_repaint;
             if needs_repaint {
-                let allow = self
+                let child_responsive = self
                     .live_view_shared
                     .lock()
-                    .map(|s| {
-                        let responsive = s.last_rendered.elapsed() < Duration::from_millis(1000);
-                        let not_unfocused = s.child_focused != Some(false);
-                        responsive && not_unfocused
-                    })
-                    .unwrap_or(false);
-                if allow {
+                    .is_ok_and(|s| s.last_rendered.elapsed() < Duration::from_millis(1000));
+                if child_responsive {
                     ctx.request_repaint_of(live_view_viewport_id);
                 }
                 self.live_view_needs_initial_repaint = false;
@@ -1954,34 +1957,13 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
     // ── Publish focus state to shared data ──────────────────────────────
     //
     // On Wayland the compositor sends `wl_keyboard.leave` (focused=false)
-    // before hiding a minimized surface.  The parent uses this to avoid
-    // sending `request_repaint_of` to a child that may still block (e.g.
-    // if the swap-interval-zero call was not supported by the driver).
+    // before hiding a minimized surface.  The parent can use this as a
+    // hint, but we do NOT gate rendering on focus here — the user expects
+    // the Live View to keep tracking the stream even when the main window
+    // has focus and the Live View is in the background.
     let focused = ctx.input(|i| i.viewport().focused);
     if let Ok(mut state) = shared.lock() {
         state.child_focused = focused;
-    }
-
-    // When the child is unfocused (which includes the Wayland-minimized
-    // case, since the compositor sends wl_keyboard.leave before hiding),
-    // render only a cheap empty panel.  This catches stray repaints that
-    // were already queued before the parent's focus gate kicked in.
-    // Without this guard, a single queued repaint could block indefinitely
-    // in eglSwapBuffers for a minimized Wayland surface.
-    //
-    // When the child is visible but unfocused (user clicked the main
-    // window), OS events (mouse hover/enter) still trigger renders for
-    // this viewport; those frames publish child_focused and update
-    // last_rendered, so the child remains "alive" from the parent's
-    // perspective but doesn't do expensive layout work.
-    if focused == Some(false) {
-        // Still mark as alive so the parent doesn't treat us as stale
-        // when we regain focus.
-        if let Ok(mut state) = shared.lock() {
-            state.last_rendered = Instant::now();
-        }
-        egui::CentralPanel::default().show(ctx, |_| {});
-        return;
     }
 
     // When minimized on Wayland, rendering blocks on compositor frame callbacks
