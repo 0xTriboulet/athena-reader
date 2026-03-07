@@ -28,6 +28,44 @@ use athena_core::settings::{
     ReadingCache, Theme, UserSettings, clear_reading_cache, load_reading_cache, load_settings,
     save_reading_cache, save_settings,
 };
+
+// -- Platform-specific EGL helpers for non-blocking swap_buffers ----------
+//
+// On Wayland, `eglSwapBuffers` blocks indefinitely when a surface is
+// minimized because the compositor stops issuing frame callbacks.  Setting
+// the swap interval to 0 makes the call non-blocking, preventing the
+// shared winit/eframe event loop from stalling when the Live View child
+// viewport is minimized.
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn eglGetCurrentDisplay() -> *mut std::ffi::c_void;
+    fn eglSwapInterval(display: *mut std::ffi::c_void, interval: i32) -> u32;
+}
+
+/// Attempts to set the EGL swap interval to 0 for the surface currently
+/// bound to the calling thread's GL context.
+///
+/// Returns `true` if the call succeeded.  On non-Linux platforms or when
+/// no EGL display is current this is a no-op that returns `false`.
+#[cfg(target_os = "linux")]
+fn try_set_egl_swap_interval_zero() -> bool {
+    // SAFETY: eglGetCurrentDisplay and eglSwapInterval are standard EGL 1.0
+    // entry points.  glutin (used by eframe) links libEGL.so, so the symbols
+    // are guaranteed to be available.  We only call this while the child
+    // viewport's GL context is current (inside the deferred callback).
+    unsafe {
+        let display = eglGetCurrentDisplay();
+        if display.is_null() {
+            return false;
+        }
+        eglSwapInterval(display, 0) != 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_set_egl_swap_interval_zero() -> bool {
+    false
+}
 use athena_core::text;
 use directories::ProjectDirs;
 use eframe::egui;
@@ -148,6 +186,17 @@ struct LiveViewShared {
     /// the event loop. If `last_rendered` becomes stale the parent stops
     /// requesting repaints for the child, preventing further blockage.
     last_rendered: Instant,
+    /// Whether the child viewport currently has OS focus.
+    ///
+    /// On Wayland the compositor clears focus (sends `wl_keyboard.leave`) before
+    /// minimizing a surface, so `Some(false)` serves as a reliable proxy for
+    /// "minimized or hidden."  The parent uses this to avoid sending
+    /// `request_repaint_of` to a child whose `eglSwapBuffers` would block.
+    child_focused: Option<bool>,
+    /// Set once after the child's first render to disable EGL vsync waiting
+    /// via `eglSwapInterval(0)`.  Reset on each `open_live_view()` because
+    /// eframe may create a fresh GL surface.
+    swap_interval_set: bool,
 }
 
 impl Default for LiveViewShared {
@@ -161,6 +210,8 @@ impl Default for LiveViewShared {
             close_requested: false,
             window_start: 0,
             last_rendered: Instant::now(),
+            child_focused: None,
+            swap_interval_set: false,
         }
     }
 }
@@ -966,11 +1017,14 @@ impl AthenaApp {
         }
         // Reset close flag, seed font size, and refresh the last-rendered
         // timestamp so the stale-child guard treats the viewport as responsive
-        // on the very first frame.
+        // on the very first frame.  Also reset focus and swap-interval flags
+        // because eframe may create a new GL surface for the reopened viewport.
         if let Ok(mut shared) = self.live_view_shared.lock() {
             shared.close_requested = false;
             shared.font_size = self.settings.font_size as f32;
             shared.last_rendered = Instant::now();
+            shared.child_focused = None;
+            shared.swap_interval_set = false;
         }
         self.live_view_open = true;
         self.live_view_needs_initial_repaint = true;
@@ -1300,21 +1354,32 @@ impl eframe::App for AthenaApp {
 
             // Request a child-viewport repaint only when the shared state
             // actually changed (stream advance, theme switch, etc.) or when
-            // the Live View was just opened. This prevents the child from
-            // self-polling, which would starve the main window's event loop
-            // when the child is minimized on Wayland (swap_buffers blocks on
-            // a surface whose compositor never releases buffers).
+            // the Live View was just opened.
             //
-            // Stale-child guard: if the child hasn't rendered in >500ms it is
-            // likely minimized / blocked. Stop flooding it with repaints so
-            // the event loop stays responsive.
+            // Two guards prevent the repaint from reaching a child whose
+            // `eglSwapBuffers` would block the shared event loop:
+            //
+            // 1. **Focus guard** – on Wayland the compositor clears focus
+            //    before minimizing, so `child_focused == Some(false)` is a
+            //    reliable proxy for "minimized / hidden."  We skip repaints
+            //    entirely in that state.
+            //
+            // 2. **Stale-child guard** – if the child hasn't rendered in
+            //    >1 s it may be blocked on swap-buffers.  Stop flooding it
+            //    with more requests.
             let needs_repaint = data_changed || self.live_view_needs_initial_repaint;
             if needs_repaint {
-                let child_responsive = self
+                let (child_responsive, child_not_unfocused) = self
                     .live_view_shared
                     .lock()
-                    .is_ok_and(|s| s.last_rendered.elapsed() < Duration::from_millis(1000));
-                if child_responsive {
+                    .map(|s| {
+                        (
+                            s.last_rendered.elapsed() < Duration::from_millis(1000),
+                            s.child_focused != Some(false),
+                        )
+                    })
+                    .unwrap_or((false, true));
+                if child_responsive && child_not_unfocused {
                     ctx.request_repaint_of(live_view_viewport_id);
                 }
                 self.live_view_needs_initial_repaint = false;
@@ -1740,6 +1805,37 @@ mod tests {
         // Zero viewport → should not go negative; returns max(0, highlight_y)
         assert_eq!(compute_scroll_target(100.0, 0.0), 100.0);
     }
+
+    // ── Live View: LiveViewShared default state tests ───────────────────
+
+    use super::LiveViewShared;
+
+    #[test]
+    fn live_view_shared_default_child_focused_is_none() {
+        let shared = LiveViewShared::default();
+        assert_eq!(shared.child_focused, None);
+    }
+
+    #[test]
+    fn live_view_shared_default_swap_interval_not_set() {
+        let shared = LiveViewShared::default();
+        assert!(!shared.swap_interval_set);
+    }
+
+    #[test]
+    fn live_view_shared_child_focused_gates_parent_repaint() {
+        // When child_focused is Some(false), the parent should NOT request
+        // repaints (proxy for minimized on Wayland).
+        let mut shared = LiveViewShared::default();
+        shared.child_focused = Some(false);
+        assert_eq!(shared.child_focused, Some(false));
+        // When child_focused is Some(true), repaints are allowed.
+        shared.child_focused = Some(true);
+        assert_eq!(shared.child_focused, Some(true));
+        // When child_focused is None (unknown), repaints are allowed.
+        shared.child_focused = None;
+        assert!(shared.child_focused != Some(false));
+    }
 }
 
 /// Computes the scroll offset that places the highlighted element in the top
@@ -1811,6 +1907,38 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         return;
     }
 
+    // ── Disable EGL vsync for this surface (once) ──────────────────────
+    //
+    // On Wayland, `eglSwapBuffers` with swap-interval 1 (the default set
+    // by eframe/glutin) blocks until the compositor issues a frame
+    // callback.  When a surface is minimized Mutter stops sending those
+    // callbacks, so the call blocks *indefinitely*, stalling the shared
+    // winit event loop and freezing the parent window.
+    //
+    // Setting the swap interval to 0 makes `eglSwapBuffers` return
+    // immediately.  We do this once on the child's first render; the
+    // setting persists for the lifetime of the GL surface.
+    {
+        let needs_set = shared.lock().is_ok_and(|s| !s.swap_interval_set);
+        if needs_set {
+            try_set_egl_swap_interval_zero();
+            if let Ok(mut s) = shared.lock() {
+                s.swap_interval_set = true;
+            }
+        }
+    }
+
+    // ── Publish focus state to shared data ──────────────────────────────
+    //
+    // On Wayland the compositor sends `wl_keyboard.leave` (focused=false)
+    // before hiding a minimized surface.  The parent uses this to avoid
+    // sending `request_repaint_of` to a child that may still block (e.g.
+    // if the swap-interval-zero call was not supported by the driver).
+    let focused = ctx.input(|i| i.viewport().focused);
+    if let Ok(mut state) = shared.lock() {
+        state.child_focused = focused;
+    }
+
     // When minimized on Wayland, rendering blocks on compositor frame callbacks
     // that never arrive, stalling the shared event loop and freezing the parent.
     // On Wayland the XDG-shell protocol does NOT expose minimized state, so
@@ -1826,7 +1954,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
 
     // Mark the child as alive so the parent's stale-child guard keeps sending
     // repaint requests.  This timestamp is checked by the parent each frame;
-    // if it goes stale (>500 ms) the parent stops requesting repaints,
+    // if it goes stale (>1 s) the parent stops requesting repaints,
     // preventing swap-buffer blockage for minimized/hidden surfaces.
     if let Ok(mut state) = shared.lock() {
         state.last_rendered = Instant::now();
