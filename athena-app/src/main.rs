@@ -31,34 +31,55 @@ use athena_core::settings::{
 
 // -- Platform-specific EGL helpers for non-blocking swap_buffers ----------
 //
-// On Wayland, `eglSwapBuffers` blocks indefinitely when a surface is
-// minimized because the compositor stops issuing frame callbacks.  Setting
-// the swap interval to 0 makes the call non-blocking, preventing the
-// shared winit/eframe event loop from stalling when the Live View child
-// viewport is minimized.
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn eglGetCurrentDisplay() -> *mut std::ffi::c_void;
-    fn eglSwapInterval(display: *mut std::ffi::c_void, interval: i32) -> u32;
-}
+// On Wayland, `eglSwapBuffers` with the default swap-interval (1) blocks
+// until the compositor issues a frame callback.  When a surface is minimized
+// Mutter stops sending those callbacks, so the call blocks *indefinitely*,
+// stalling the shared winit event loop and freezing the parent window.
+//
+// Setting the swap interval to 0 makes `eglSwapBuffers` non-blocking.
+// We look up the EGL symbols at runtime via `dlsym(RTLD_DEFAULT, …)` —
+// glutin has already loaded libEGL.so by the time we call this, so the
+// symbols are present in the process without any additional link-time
+// dependency.
 
 /// Attempts to set the EGL swap interval to 0 for the surface currently
 /// bound to the calling thread's GL context.
 ///
-/// Returns `true` if the call succeeded.  On non-Linux platforms or when
-/// no EGL display is current this is a no-op that returns `false`.
+/// Uses `dlsym(RTLD_DEFAULT, …)` to locate `eglGetCurrentDisplay` and
+/// `eglSwapInterval` in the already-loaded libEGL.so (loaded by glutin).
+/// Returns `true` if the call succeeded.  On non-Linux platforms, or when
+/// the EGL symbols are not available, this is a no-op that returns `false`.
 #[cfg(target_os = "linux")]
 fn try_set_egl_swap_interval_zero() -> bool {
-    // SAFETY: eglGetCurrentDisplay and eglSwapInterval are standard EGL 1.0
-    // entry points.  glutin (used by eframe) links libEGL.so, so the symbols
-    // are guaranteed to be available.  We only call this while the child
-    // viewport's GL context is current (inside the deferred callback).
+    use std::ffi::c_void;
+
+    // `dlsym` is provided by libdl, which is already linked (-ldl).
+    unsafe extern "C" {
+        unsafe fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+    }
+
+    // glibc defines RTLD_DEFAULT as ((void *)0).
+    const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
+
+    // SAFETY: We transmute raw dlsym pointers into typed fn pointers whose
+    // signatures match the EGL 1.0 spec.  The symbols are guaranteed to be
+    // loaded by glutin/eframe before any child viewport renders.
     unsafe {
-        let display = eglGetCurrentDisplay();
+        let p_get_display = dlsym(RTLD_DEFAULT, c"eglGetCurrentDisplay".as_ptr().cast::<i8>());
+        let p_swap_interval = dlsym(RTLD_DEFAULT, c"eglSwapInterval".as_ptr().cast::<i8>());
+        if p_get_display.is_null() || p_swap_interval.is_null() {
+            return false;
+        }
+
+        let get_display: unsafe extern "C" fn() -> *mut c_void = std::mem::transmute(p_get_display);
+        let swap_interval: unsafe extern "C" fn(*mut c_void, i32) -> u32 =
+            std::mem::transmute(p_swap_interval);
+
+        let display = get_display();
         if display.is_null() {
             return false;
         }
-        eglSwapInterval(display, 0) != 0
+        swap_interval(display, 0) != 0
     }
 }
 
