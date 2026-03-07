@@ -11,6 +11,10 @@ This repository is a Rust workspace with:
 - `athena-core`: OCR + text normalization/tokenization + reading session logic
 - `athena-app`: egui/eframe GUI application
 
+<p align="center">
+![alt text](<Screencast from 2026-03-06 21-04-34.gif>)
+</p>
+
 ## Capabilities at a glance
 
 - Import files: image (`png/jpg/jpeg/bmp/tif/tiff/webp`), PDF, EPUB, and `.txt`
