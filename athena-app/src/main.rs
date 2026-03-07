@@ -1755,6 +1755,15 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         return;
     }
 
+    // When minimized on Wayland, rendering blocks on compositor frame callbacks
+    // that never arrive, stalling the shared event loop and freezing the parent.
+    // Render a cheap empty panel and skip all repaint requests until unminimized.
+    let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
+    if minimized {
+        egui::CentralPanel::default().show(ctx, |_| {});
+        return;
+    }
+
     // Read the snapshot under a short lock, then drop it before rendering.
     let (text_data, current_index, chunk_size, theme, mut font_size, mut window_start) = {
         let Ok(state) = shared.lock() else {
