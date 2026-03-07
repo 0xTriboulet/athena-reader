@@ -138,6 +138,9 @@ struct LiveViewShared {
     font_size: f32,
     /// Set by the deferred callback when the user closes the Live View window.
     close_requested: bool,
+    /// Stable leading edge of the sliding token window (persists across frames).
+    /// Only reset when the highlight moves far outside the current window.
+    window_start: usize,
 }
 
 impl Default for LiveViewShared {
@@ -149,6 +152,7 @@ impl Default for LiveViewShared {
             theme: Theme::Dark,
             font_size: 32.0,
             close_requested: false,
+            window_start: 0,
         }
     }
 }
@@ -1755,7 +1759,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
     }
 
     // Read the snapshot under a short lock, then drop it before rendering.
-    let (text_data, current_index, chunk_size, theme, mut font_size) = {
+    let (text_data, current_index, chunk_size, theme, mut font_size, mut window_start) = {
         let Ok(state) = shared.lock() else {
             return;
         };
@@ -1775,6 +1779,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
             state.chunk_size,
             state.theme.clone(),
             state.font_size,
+            state.window_start,
         )
     };
 
@@ -1793,38 +1798,47 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         });
     });
 
-    // Write the (possibly updated) font size back to shared state.
+    // Write the (possibly updated) font size back.
     if let Ok(mut state) = shared.lock() {
         state.font_size = font_size;
     }
 
+    // Compute the stable sliding window BEFORE the panel closure so we can
+    // persist the updated window_start afterwards.
+    let num_tokens = text_data.token_byte_starts.len();
+    let current = current_index.min(num_tokens.saturating_sub(1));
+    let highlight_end = (current + chunk_size).min(num_tokens);
+
+    // window_start is pinned so text before the highlight never reflows.
+    // The window only grows at the trailing edge as words stream in.
+    // Reset only when the highlight escapes the current window (rewind or
+    // after streaming past 2×TOKEN_WINDOW tokens from window_start).
+    const TOKEN_WINDOW: usize = 1500;
+
+    if current < window_start || current > window_start + 2 * TOKEN_WINDOW {
+        window_start = current.saturating_sub(TOKEN_WINDOW);
+    }
+    let window_end = (window_start + 3 * TOKEN_WINDOW).min(num_tokens);
+
+    // Persist the (possibly updated) window position.
+    if let Ok(mut state) = shared.lock() {
+        state.window_start = window_start;
+    }
+
+    let base_byte = text_data.token_byte_starts[window_start];
+    let end_byte = text_data.token_byte_ends[window_end - 1];
+    let windowed_text = text_data.full_text[base_byte..end_byte].to_owned();
+
+    let hl_byte_start = text_data.token_byte_starts[current] - base_byte;
+    let hl_byte_end = if highlight_end > 0 {
+        text_data.token_byte_ends[highlight_end - 1] - base_byte
+    } else {
+        hl_byte_start
+    };
+    let hl_char_start =
+        text_data.token_char_starts[current] - text_data.token_char_starts[window_start];
+
     egui::CentralPanel::default().show(ctx, |ui| {
-        let num_tokens = text_data.token_byte_starts.len();
-        let current = current_index.min(num_tokens.saturating_sub(1));
-        let highlight_end = (current + chunk_size).min(num_tokens);
-
-        // Only layout a sliding window of tokens around the highlight.
-        // This caps the layout cost at ~18K chars regardless of document size,
-        // preventing hangs when the window width changes (e.g. maximize).
-        const TOKEN_WINDOW: usize = 1500;
-        let window_start = current.saturating_sub(TOKEN_WINDOW);
-        let window_end = (highlight_end + TOKEN_WINDOW).min(num_tokens);
-
-        let base_byte = text_data.token_byte_starts[window_start];
-        let end_byte = text_data.token_byte_ends[window_end - 1];
-        let windowed_text = &text_data.full_text[base_byte..end_byte];
-
-        // Highlight byte offsets relative to the windowed text.
-        let hl_byte_start = text_data.token_byte_starts[current] - base_byte;
-        let hl_byte_end = if highlight_end > 0 {
-            text_data.token_byte_ends[highlight_end - 1] - base_byte
-        } else {
-            hl_byte_start
-        };
-        // Char offset relative to the windowed text.
-        let hl_char_start =
-            text_data.token_char_starts[current] - text_data.token_char_starts[window_start];
-
         let normal_color = ui.visuals().text_color();
         let highlight_color = match theme {
             Theme::Light => egui::Color32::from_rgb(0, 120, 255),
@@ -1868,7 +1882,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         }
 
         let job = egui::text::LayoutJob {
-            text: windowed_text.to_owned(),
+            text: windowed_text.clone(),
             sections,
             wrap: egui::text::TextWrapping {
                 max_width: ui.available_width(),
