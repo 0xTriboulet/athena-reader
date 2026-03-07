@@ -1377,22 +1377,31 @@ impl eframe::App for AthenaApp {
             // actually changed (stream advance, theme switch, etc.) or when
             // the Live View was just opened.
             //
-            // Stale-child guard: if the child hasn't rendered in >1 s it is
-            // likely blocked on swap-buffers (e.g. minimized on a compositor
-            // where eglSwapInterval(0) wasn't honored).  Stop flooding it
-            // with requests so the event loop stays responsive.
+            // Two guards prevent `request_repaint_of` from reaching a child
+            // whose `eglSwapBuffers` would block the shared event loop:
             //
-            // The focus gate was removed: with eglSwapInterval(0) in place,
-            // swap_buffers is non-blocking even when minimized, so unfocused
-            // but *visible* children (the normal case when the user watches
-            // the main stream) must still receive repaints.
+            // 1. **Focus guard** – on Wayland the compositor sends
+            //    `wl_keyboard.leave` before minimizing a surface, so
+            //    `child_focused == Some(false)` is a reliable proxy.
+            //    We skip repaints in that state.  When the Live View is
+            //    unfocused but *visible* (user clicked the main window),
+            //    OS events (mouse hover, etc.) still trigger child renders
+            //    that pick up the latest shared state on demand.
+            //
+            // 2. **Stale-child guard** – if the child hasn't rendered in
+            //    >1 s it may be blocked on swap-buffers.  Stop flooding it.
             let needs_repaint = data_changed || self.live_view_needs_initial_repaint;
             if needs_repaint {
-                let child_responsive = self
+                let allow = self
                     .live_view_shared
                     .lock()
-                    .is_ok_and(|s| s.last_rendered.elapsed() < Duration::from_millis(1000));
-                if child_responsive {
+                    .map(|s| {
+                        let responsive = s.last_rendered.elapsed() < Duration::from_millis(1000);
+                        let not_unfocused = s.child_focused != Some(false);
+                        responsive && not_unfocused
+                    })
+                    .unwrap_or(false);
+                if allow {
                     ctx.request_repaint_of(live_view_viewport_id);
                 }
                 self.live_view_needs_initial_repaint = false;
@@ -1953,6 +1962,28 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         state.child_focused = focused;
     }
 
+    // When the child is unfocused (which includes the Wayland-minimized
+    // case, since the compositor sends wl_keyboard.leave before hiding),
+    // render only a cheap empty panel.  This catches stray repaints that
+    // were already queued before the parent's focus gate kicked in.
+    // Without this guard, a single queued repaint could block indefinitely
+    // in eglSwapBuffers for a minimized Wayland surface.
+    //
+    // When the child is visible but unfocused (user clicked the main
+    // window), OS events (mouse hover/enter) still trigger renders for
+    // this viewport; those frames publish child_focused and update
+    // last_rendered, so the child remains "alive" from the parent's
+    // perspective but doesn't do expensive layout work.
+    if focused == Some(false) {
+        // Still mark as alive so the parent doesn't treat us as stale
+        // when we regain focus.
+        if let Ok(mut state) = shared.lock() {
+            state.last_rendered = Instant::now();
+        }
+        egui::CentralPanel::default().show(ctx, |_| {});
+        return;
+    }
+
     // When minimized on Wayland, rendering blocks on compositor frame callbacks
     // that never arrive, stalling the shared event loop and freezing the parent.
     // On Wayland the XDG-shell protocol does NOT expose minimized state, so
@@ -1962,7 +1993,6 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
     let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
     if minimized {
         egui::CentralPanel::default().show(ctx, |_| {});
-        // Do NOT request any repaints — the parent drives the schedule.
         return;
     }
 
