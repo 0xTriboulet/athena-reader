@@ -964,10 +964,13 @@ impl AthenaApp {
         {
             self.pause();
         }
-        // Reset close flag and seed font size from app settings.
+        // Reset close flag, seed font size, and refresh the last-rendered
+        // timestamp so the stale-child guard treats the viewport as responsive
+        // on the very first frame.
         if let Ok(mut shared) = self.live_view_shared.lock() {
             shared.close_requested = false;
             shared.font_size = self.settings.font_size as f32;
+            shared.last_rendered = Instant::now();
         }
         self.live_view_open = true;
         self.live_view_needs_initial_repaint = true;
@@ -1310,7 +1313,7 @@ impl eframe::App for AthenaApp {
                 let child_responsive = self
                     .live_view_shared
                     .lock()
-                    .is_ok_and(|s| s.last_rendered.elapsed() < Duration::from_millis(500));
+                    .is_ok_and(|s| s.last_rendered.elapsed() < Duration::from_millis(1000));
                 if child_responsive {
                     ctx.request_repaint_of(live_view_viewport_id);
                 }
@@ -1987,11 +1990,19 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
             });
     });
 
-    // Do NOT call request_repaint_after() here.
-    // The child's repaints are driven entirely by the parent's
-    // request_repaint_of() when shared state changes.  Self-polling would
-    // create a continuous render loop that blocks swap_buffers on Wayland
-    // when the child is minimized, freezing the main window.
+    // Self-poll only while the viewport has focus.  When the user is looking
+    // at the Live View, 200 ms polls keep the highlight and font-size slider
+    // responsive without waiting for the next parent-driven repaint.
+    //
+    // When unfocused (which includes the Wayland-minimized case, since the
+    // compositor sends wl_keyboard.leave before hiding the surface) we skip
+    // the self-poll entirely and rely on the parent's request_repaint_of() to
+    // drive updates.  This avoids the continuous swap_buffers loop that blocks
+    // the shared event loop on Wayland when the surface is hidden.
+    let focused = ctx.input(|i| i.viewport().focused == Some(true));
+    if focused {
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
 }
 
 /// GUI entry point.
