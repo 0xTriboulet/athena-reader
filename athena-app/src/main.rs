@@ -1741,14 +1741,17 @@ fn build_live_view_text_data(tokens: &[String]) -> LiveViewTextData {
 /// auto-scroll. Runs in the child viewport's context, decoupled from the
 /// parent event loop.
 fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewShared>>) {
-    if ctx.input(|input| input.viewport().close_requested()) {
-        if let Ok(mut state) = shared.lock() {
+    // Once close has been requested (this frame or a prior one), render only
+    // a cheap empty panel for every remaining frame during the Wayland close
+    // animation, avoiding expensive LayoutJob relayouts on each resize step.
+    let already_closing = shared.lock().is_ok_and(|s| s.close_requested);
+    if already_closing || ctx.input(|input| input.viewport().close_requested()) {
+        if !already_closing
+            && let Ok(mut state) = shared.lock()
+        {
             state.close_requested = true;
         }
-        // Wake the parent so it processes the flag on its next frame.
         ctx.request_repaint_of(egui::ViewportId::ROOT);
-        // Still render a minimal frame so the compositor gets a valid
-        // surface and doesn't stall waiting for content.
         egui::CentralPanel::default().show(ctx, |_| {});
         return;
     }
