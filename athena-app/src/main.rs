@@ -1405,7 +1405,8 @@ impl eframe::App for AthenaApp {
                     .with_title("Live View")
                     .with_inner_size(egui::vec2(720.0, 540.0))
                     .with_min_inner_size(egui::vec2(400.0, 300.0))
-                    .with_resizable(true),
+                    .with_resizable(true)
+                    .with_minimize_button(false),
                 move |ctx, _class| {
                     render_live_view_deferred(ctx, &shared);
                 },
