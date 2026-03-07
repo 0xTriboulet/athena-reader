@@ -1745,6 +1745,11 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         if let Ok(mut state) = shared.lock() {
             state.close_requested = true;
         }
+        // Wake the parent so it processes the flag on its next frame.
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        // Still render a minimal frame so the compositor gets a valid
+        // surface and doesn't stall waiting for content.
+        egui::CentralPanel::default().show(ctx, |_| {});
         return;
     }
 
