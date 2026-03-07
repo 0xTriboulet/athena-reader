@@ -141,6 +141,13 @@ struct LiveViewShared {
     /// Stable leading edge of the sliding token window (persists across frames).
     /// Only reset when the highlight moves far outside the current window.
     window_start: usize,
+    /// Timestamp of the child's last completed render frame.
+    ///
+    /// The parent uses this to detect whether the child viewport is responsive.
+    /// When the child is minimized on Wayland, swap-buffers may block, stalling
+    /// the event loop. If `last_rendered` becomes stale the parent stops
+    /// requesting repaints for the child, preventing further blockage.
+    last_rendered: Instant,
 }
 
 impl Default for LiveViewShared {
@@ -153,6 +160,7 @@ impl Default for LiveViewShared {
             font_size: 32.0,
             close_requested: false,
             window_start: 0,
+            last_rendered: Instant::now(),
         }
     }
 }
@@ -180,6 +188,9 @@ struct AthenaApp {
     ocr_started_at: Option<Instant>,
     import_rx: Option<mpsc::Receiver<ImportResponse>>,
     edit_anchor: Option<EditAnchor>,
+    /// Set when the Live View is first opened so the parent triggers an initial
+    /// child repaint on the next frame (before any data change).
+    live_view_needs_initial_repaint: bool,
 }
 
 impl AthenaApp {
@@ -240,6 +251,7 @@ impl AthenaApp {
             ocr_started_at: None,
             import_rx: None,
             edit_anchor: None,
+            live_view_needs_initial_repaint: false,
         }
     }
 
@@ -958,6 +970,7 @@ impl AthenaApp {
             shared.font_size = self.settings.font_size as f32;
         }
         self.live_view_open = true;
+        self.live_view_needs_initial_repaint = true;
     }
 
     /// Updates the shared Live View state from the current session and settings.
@@ -965,25 +978,43 @@ impl AthenaApp {
     /// Called every frame while the Live View is open. Rebuilds the pre-computed
     /// text data only when the underlying tokens change (detected by comparing
     /// `raw_text`). The per-frame cost is O(1) for highlight/settings updates.
-    fn sync_live_view_shared(&mut self) {
+    ///
+    /// Returns `true` if any shared field was modified, allowing the caller to
+    /// conditionally request a child-viewport repaint.
+    fn sync_live_view_shared(&mut self) -> bool {
         let Ok(mut shared) = self.live_view_shared.lock() else {
-            return;
+            return false;
         };
+
+        let mut changed = false;
 
         if let Some(session) = self.session.as_ref() {
             // Rebuild text data only when the token source changes.
             if self.live_view_text_source != session.raw_text {
                 self.live_view_text_source = session.raw_text.clone();
                 shared.text_data = Some(Arc::new(build_live_view_text_data(&session.tokens)));
+                changed = true;
             }
 
-            shared.current_index = session.current_index;
-            shared.chunk_size = session.chunk_size;
-            shared.theme = self.settings.theme.clone();
+            if shared.current_index != session.current_index {
+                shared.current_index = session.current_index;
+                changed = true;
+            }
+            if shared.chunk_size != session.chunk_size {
+                shared.chunk_size = session.chunk_size;
+                changed = true;
+            }
+            if shared.theme != self.settings.theme {
+                shared.theme = self.settings.theme.clone();
+                changed = true;
+            }
             // font_size is controlled by the Live View slider, not overwritten here.
-        } else {
+        } else if shared.text_data.is_some() {
             shared.text_data = None;
+            changed = true;
         }
+
+        changed
     }
 }
 
@@ -1262,7 +1293,29 @@ impl eframe::App for AthenaApp {
         }
 
         if self.live_view_open {
-            self.sync_live_view_shared();
+            let data_changed = self.sync_live_view_shared();
+
+            // Request a child-viewport repaint only when the shared state
+            // actually changed (stream advance, theme switch, etc.) or when
+            // the Live View was just opened. This prevents the child from
+            // self-polling, which would starve the main window's event loop
+            // when the child is minimized on Wayland (swap_buffers blocks on
+            // a surface whose compositor never releases buffers).
+            //
+            // Stale-child guard: if the child hasn't rendered in >500ms it is
+            // likely minimized / blocked. Stop flooding it with repaints so
+            // the event loop stays responsive.
+            let needs_repaint = data_changed || self.live_view_needs_initial_repaint;
+            if needs_repaint {
+                let child_responsive = self
+                    .live_view_shared
+                    .lock()
+                    .is_ok_and(|s| s.last_rendered.elapsed() < Duration::from_millis(500));
+                if child_responsive {
+                    ctx.request_repaint_of(live_view_viewport_id);
+                }
+                self.live_view_needs_initial_repaint = false;
+            }
 
             let shared = Arc::clone(&self.live_view_shared);
             ctx.show_viewport_deferred(
@@ -1757,11 +1810,23 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
 
     // When minimized on Wayland, rendering blocks on compositor frame callbacks
     // that never arrive, stalling the shared event loop and freezing the parent.
-    // Render a cheap empty panel and skip all repaint requests until unminimized.
+    // On Wayland the XDG-shell protocol does NOT expose minimized state, so
+    // `minimized` is always `None`.  We therefore treat `Some(true)` as the
+    // only definitive signal and rely on the parent-side stale-child guard for
+    // Wayland (see `update()`).
     let minimized = ctx.input(|i| i.viewport().minimized == Some(true));
     if minimized {
         egui::CentralPanel::default().show(ctx, |_| {});
+        // Do NOT request any repaints — the parent drives the schedule.
         return;
+    }
+
+    // Mark the child as alive so the parent's stale-child guard keeps sending
+    // repaint requests.  This timestamp is checked by the parent each frame;
+    // if it goes stale (>500 ms) the parent stops requesting repaints,
+    // preventing swap-buffer blockage for minimized/hidden surfaces.
+    if let Ok(mut state) = shared.lock() {
+        state.last_rendered = Instant::now();
     }
 
     // Read the snapshot under a short lock, then drop it before rendering.
@@ -1906,23 +1971,27 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         let viewport_height = ui.available_height();
         let target_offset = compute_scroll_target(highlight_y, viewport_height);
 
-        let scroll_id = ui.id().with("live_view_scroll");
-        let smoothed_offset = ctx.animate_value_with_time(scroll_id, target_offset, 0.3);
+        // Use the target offset directly instead of animate_value_with_time.
+        // animate_value_with_time calls ctx.request_repaint() internally while
+        // interpolating, creating a 60 fps self-repaint burst that starves the
+        // main window's event loop when the child is minimized on Wayland.
+        // At streaming rates (~4 fps at 240 WPM) the per-word scroll jump is
+        // small enough to appear smooth.
 
         egui::ScrollArea::vertical()
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .auto_shrink([false, false])
-            .vertical_scroll_offset(smoothed_offset)
+            .vertical_scroll_offset(target_offset)
             .show(ui, |ui| {
                 ui.label(galley);
             });
     });
 
-    // Self-schedule a gentle poll so the child picks up shared-state changes
-    // (e.g. stream advance) without the parent forcing repaints. The backend
-    // handles this correctly for minimized windows, unlike request_repaint_of
-    // from the parent which can stall the event loop on Wayland.
-    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    // Do NOT call request_repaint_after() here.
+    // The child's repaints are driven entirely by the parent's
+    // request_repaint_of() when shared state changes.  Self-polling would
+    // create a continuous render loop that blocks swap_buffers on Wayland
+    // when the child is minimized, freezing the main window.
 }
 
 /// GUI entry point.
