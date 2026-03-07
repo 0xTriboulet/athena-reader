@@ -12,7 +12,7 @@ This repository is a Rust workspace with:
 - `athena-app`: egui/eframe GUI application
 
 <p align="center">
-![alt text](<Screencast from 2026-03-06 21-04-34.gif>)
+  <img src="Screencast%20from%202026-03-06 21-04-34.gif" alt="Demo_0" />
 </p>
 
 ## Capabilities at a glance
@@ -27,7 +27,7 @@ This repository is a Rust workspace with:
 - Local persistence of user settings and paused reading position across app restarts
 
 <p align="center">
-  <img src="Screencast%20from%202026-02-22%2019-33-17.gif" alt="Demo" />
+  <img src="Screencast%20from%202026-02-22%2019-33-17.gif" alt="Demo_1" />
 </p>
 
 ## How it works (User flow)
