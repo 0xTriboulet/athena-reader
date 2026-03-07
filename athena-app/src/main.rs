@@ -1276,9 +1276,6 @@ impl eframe::App for AthenaApp {
                     render_live_view_deferred(ctx, &shared);
                 },
             );
-
-            // Nudge the child viewport to repaint when session data changes.
-            ctx.request_repaint_of(live_view_viewport_id);
         }
     }
 }
@@ -1911,6 +1908,12 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
                 ui.label(galley);
             });
     });
+
+    // Self-schedule a gentle poll so the child picks up shared-state changes
+    // (e.g. stream advance) without the parent forcing repaints. The backend
+    // handles this correctly for minimized windows, unlike request_repaint_of
+    // from the parent which can stall the event loop on Wayland.
+    ctx.request_repaint_after(std::time::Duration::from_millis(50));
 }
 
 /// GUI entry point.
