@@ -1377,30 +1377,22 @@ impl eframe::App for AthenaApp {
             // actually changed (stream advance, theme switch, etc.) or when
             // the Live View was just opened.
             //
-            // Two guards prevent the repaint from reaching a child whose
-            // `eglSwapBuffers` would block the shared event loop:
+            // Stale-child guard: if the child hasn't rendered in >1 s it is
+            // likely blocked on swap-buffers (e.g. minimized on a compositor
+            // where eglSwapInterval(0) wasn't honored).  Stop flooding it
+            // with requests so the event loop stays responsive.
             //
-            // 1. **Focus guard** – on Wayland the compositor clears focus
-            //    before minimizing, so `child_focused == Some(false)` is a
-            //    reliable proxy for "minimized / hidden."  We skip repaints
-            //    entirely in that state.
-            //
-            // 2. **Stale-child guard** – if the child hasn't rendered in
-            //    >1 s it may be blocked on swap-buffers.  Stop flooding it
-            //    with more requests.
+            // The focus gate was removed: with eglSwapInterval(0) in place,
+            // swap_buffers is non-blocking even when minimized, so unfocused
+            // but *visible* children (the normal case when the user watches
+            // the main stream) must still receive repaints.
             let needs_repaint = data_changed || self.live_view_needs_initial_repaint;
             if needs_repaint {
-                let (child_responsive, child_not_unfocused) = self
+                let child_responsive = self
                     .live_view_shared
                     .lock()
-                    .map(|s| {
-                        (
-                            s.last_rendered.elapsed() < Duration::from_millis(1000),
-                            s.child_focused != Some(false),
-                        )
-                    })
-                    .unwrap_or((false, true));
-                if child_responsive && child_not_unfocused {
+                    .is_ok_and(|s| s.last_rendered.elapsed() < Duration::from_millis(1000));
+                if child_responsive {
                     ctx.request_repaint_of(live_view_viewport_id);
                 }
                 self.live_view_needs_initial_repaint = false;
