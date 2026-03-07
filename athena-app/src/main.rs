@@ -1783,7 +1783,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
     egui::TopBottomPanel::bottom("live_view_controls").show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.label("Font size:");
-            ui.add(egui::Slider::new(&mut font_size, 10.0..=80.0).suffix("px"));
+            ui.add(egui::Slider::new(&mut font_size, 18.0..=200.0));
         });
     });
 
@@ -1802,7 +1802,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
             Theme::Light => egui::Color32::from_rgb(0, 120, 255),
             _ => egui::Color32::YELLOW,
         };
-        let clamped_font_size = font_size.clamp(10.0, 80.0);
+        let clamped_font_size = font_size.clamp(18.0, 200.0);
         let font_id = egui::FontId::proportional(clamped_font_size);
 
         let normal_fmt = egui::text::TextFormat {
