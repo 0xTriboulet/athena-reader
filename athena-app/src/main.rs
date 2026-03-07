@@ -1746,9 +1746,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
     // animation, avoiding expensive LayoutJob relayouts on each resize step.
     let already_closing = shared.lock().is_ok_and(|s| s.close_requested);
     if already_closing || ctx.input(|input| input.viewport().close_requested()) {
-        if !already_closing
-            && let Ok(mut state) = shared.lock()
-        {
+        if !already_closing && let Ok(mut state) = shared.lock() {
             state.close_requested = true;
         }
         ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -1805,6 +1803,28 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
         let current = current_index.min(num_tokens.saturating_sub(1));
         let highlight_end = (current + chunk_size).min(num_tokens);
 
+        // Only layout a sliding window of tokens around the highlight.
+        // This caps the layout cost at ~18K chars regardless of document size,
+        // preventing hangs when the window width changes (e.g. maximize).
+        const TOKEN_WINDOW: usize = 1500;
+        let window_start = current.saturating_sub(TOKEN_WINDOW);
+        let window_end = (highlight_end + TOKEN_WINDOW).min(num_tokens);
+
+        let base_byte = text_data.token_byte_starts[window_start];
+        let end_byte = text_data.token_byte_ends[window_end - 1];
+        let windowed_text = &text_data.full_text[base_byte..end_byte];
+
+        // Highlight byte offsets relative to the windowed text.
+        let hl_byte_start = text_data.token_byte_starts[current] - base_byte;
+        let hl_byte_end = if highlight_end > 0 {
+            text_data.token_byte_ends[highlight_end - 1] - base_byte
+        } else {
+            hl_byte_start
+        };
+        // Char offset relative to the windowed text.
+        let hl_char_start =
+            text_data.token_char_starts[current] - text_data.token_char_starts[window_start];
+
         let normal_color = ui.visuals().text_color();
         let highlight_color = match theme {
             Theme::Light => egui::Color32::from_rgb(0, 120, 255),
@@ -1825,16 +1845,7 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
             ..Default::default()
         };
 
-        // O(1) lookups into the pre-computed offset tables.
-        let hl_byte_start = text_data.token_byte_starts[current];
-        let hl_byte_end = if highlight_end > 0 {
-            text_data.token_byte_ends[highlight_end - 1]
-        } else {
-            hl_byte_start
-        };
-        let hl_char_start = text_data.token_char_starts[current];
-
-        // Build 1–3 LayoutSections.
+        let windowed_len = windowed_text.len();
         let mut sections = Vec::with_capacity(3);
         if hl_byte_start > 0 {
             sections.push(egui::text::LayoutSection {
@@ -1848,16 +1859,16 @@ fn render_live_view_deferred(ctx: &egui::Context, shared: &Arc<Mutex<LiveViewSha
             byte_range: hl_byte_start..hl_byte_end,
             format: highlight_fmt,
         });
-        if hl_byte_end < text_data.full_text.len() {
+        if hl_byte_end < windowed_len {
             sections.push(egui::text::LayoutSection {
                 leading_space: 0.0,
-                byte_range: hl_byte_end..text_data.full_text.len(),
+                byte_range: hl_byte_end..windowed_len,
                 format: normal_fmt,
             });
         }
 
         let job = egui::text::LayoutJob {
-            text: text_data.full_text.clone(),
+            text: windowed_text.to_owned(),
             sections,
             wrap: egui::text::TextWrapping {
                 max_width: ui.available_width(),
