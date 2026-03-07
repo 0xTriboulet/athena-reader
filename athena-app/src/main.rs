@@ -1383,28 +1383,24 @@ impl eframe::App for AthenaApp {
         }
 
         if self.live_view_open {
-            let data_changed = self.sync_live_view_shared();
+            let _data_changed = self.sync_live_view_shared();
 
-            // Request a child-viewport repaint only when the shared state
-            // actually changed (stream advance, theme switch, etc.) or when
-            // the Live View was just opened.
+            // Always request a child repaint while the Live View is open.
+            // This ensures the child mirrors every parent-side action (play,
+            // pause, seek, theme change) immediately, not just on stream
+            // advances.  egui internally caches the layout, so redundant
+            // repaints are cheap.
             //
             // Stale-child guard: if the child hasn't rendered in >1 s it is
             // likely blocked on swap-buffers (e.g. minimized on a compositor
             // where eglSwapInterval(0) wasn't honored).  Stop flooding it
             // with requests so the event loop stays responsive.
-            //
-            // No focus gate: with eglSwapInterval(0) properly set via dlopen
-            // (not RTLD_DEFAULT), swap_buffers is non-blocking even for
-            // minimized surfaces, so background-visible children must keep
-            // receiving repaints to track the word stream in real time.
-            let needs_repaint = data_changed || self.live_view_needs_initial_repaint;
-            if needs_repaint {
+            {
                 let child_responsive = self
                     .live_view_shared
                     .lock()
                     .is_ok_and(|s| s.last_rendered.elapsed() < Duration::from_millis(1000));
-                if child_responsive {
+                if child_responsive || self.live_view_needs_initial_repaint {
                     ctx.request_repaint_of(live_view_viewport_id);
                 }
                 self.live_view_needs_initial_repaint = false;
