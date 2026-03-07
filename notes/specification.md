@@ -6,6 +6,7 @@ Athena Reader is a native desktop speed-reading tool that lets a user paste or i
 ## Progress
 _Historical implementation log; older entries may describe superseded intermediate decisions._
 
+- 2026-03-07: Live View v0.3.0 release. Added font size slider, real-time background tracking, and extensive Wayland freeze fixes (eglSwapInterval(0) via dlopen, stale-child guard, sliding token window, early-exit close rendering). Minimize button hidden. 13 new unit tests. Tests run: `cargo fmt`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.
 - 2026-03-06: Added Live View feature: a "+" button in the preview panel opens a separate OS window showing all tokens as flowing text with the current streaming word highlighted (theme-aware color + underline). The viewport smoothly auto-scrolls to keep the highlight in the top 1/3. Opening Live View pauses playback. TDD approach with 10 new unit tests. Tests run: `cargo fmt`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.
 - 2026-02-25: Added unified clipboard paste support for text and images in the app control flow. The Paste control now prefers clipboard text when both text and image are present, and falls back to image OCR otherwise. Tests run: `cargo fmt`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.
 - 2026-02-25: Improved editor-save position behavior: opening the editor from preview pauses playback, and Save remaps to the closest logical reading position in edited text (with fallback to index 0 when out of range). Tests run: `cargo fmt`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.
@@ -125,8 +126,12 @@ _Historical implementation log; older entries may describe superseded intermedia
 - Opening the Live View pauses playback if currently playing.
 - The Live View renders all tokens as flowing text with the current word (or chunk) highlighted using theme-aware color and underline.
 - The viewport smoothly auto-scrolls to keep the highlighted word in the top one-third of the visible area.
+- The Live View has an independent font size slider (range 18–200).
+- The Live View mirrors all playback actions from the main window (play, pause, seek, theme change) in real time, including when the main window has focus and the Live View is in the background.
 - The Live View is read-only; edits must use the Edit Text window.
 - Closing the Live View (via window close button) does not change playback state.
+- The minimize button is hidden from the title bar to prevent Wayland compositor freeze issues (compositor support for this hint may vary).
+- On Linux/Wayland, `eglSwapInterval(0)` is set via runtime `dlopen`/`dlsym` to prevent `eglSwapBuffers` from blocking the shared event loop when the surface is hidden. A stale-child guard (1 s) provides a fallback safety net.
 
 ### 6.6 Settings and Persistence
 - Persist WPM, chunk size, font size, and theme locally (app config file).
@@ -203,6 +208,7 @@ _Historical implementation log; older entries may describe superseded intermedia
   - Settings and paused-reading cache persistence
   - EPUB extraction error handling
   - Editor remap and restore behavior in app-layer tests
+  - Live View highlight layout building, scroll-target calculation, and shared state defaults
 - Future improvements:
   - Integration tests for OCR pipeline on fixture images
   - Extended manual UX testing for keyboard workflows and failure states

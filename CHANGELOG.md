@@ -2,13 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.3.0] - 2026-03-06
+## [0.3.0] - 2026-03-07
 
 ### Added
 - Live View window: "+" button at bottom-right of preview panel opens a separate OS window with read-only flowing text and the currently-streaming word highlighted
 - Smooth auto-scroll in Live View keeps the highlighted word in the top 1/3 of the viewport
+- Live View font size slider (18–200) independent of main window
+- Live View mirrors all playback actions (play, pause, seek) from the main window in real time, including when the main window has focus
 - Opening Live View pauses playback if currently playing
-- 10 new unit tests covering highlight layout building and scroll-target calculation
+- 13 new unit tests covering highlight layout building, scroll-target calculation, and shared state defaults
+
+### Fixed
+- Live View no longer freezes the main window when minimized on Wayland (eglSwapInterval(0) via dlopen + stale-child guard)
+- Live View no longer hangs when maximized on Wayland (sliding token window caps layout cost)
+- Live View close no longer causes a delay (early-exit rendering during close animation)
+- Minimize button hidden from Live View title bar (compositor support may vary)
 
 ## [0.2.1] - 2026-03-01
 

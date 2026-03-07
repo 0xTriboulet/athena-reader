@@ -18,6 +18,7 @@ This repository is a Rust workspace with:
 - Non-blocking background processing for import/OCR/extraction
 - ORP-style centered reading display with configurable WPM, chunk size, font size, and theme
 - Read-only preview with separate **Edit Text** window (double-click preview)
+- **Live View**: a "+" button opens a separate window showing all text with the currently-streaming word highlighted and auto-scrolling — tracks the stream in real time, even when the main window has focus
 - Editor-open pauses playback; editor-save rebuilds playback text and remaps reading position
 - Local persistence of user settings and paused reading position across app restarts
 
@@ -78,6 +79,14 @@ This repository is a Rust workspace with:
 - **Preview panel**
   - Shows the first 25 words of extracted text.
   - Double-click to open **Edit Text**; **Save** rebuilds the reading session from the edited text (paused).
+  - **"+" button** (bottom-right): opens the **Live View** window.
+- **Live View window**
+  - Separate OS window displaying all tokens as flowing text.
+  - The current word (or chunk) is highlighted with a theme-aware color and underline.
+  - Auto-scrolls to keep the highlighted word in the top 1/3 of the viewport.
+  - Adjustable font size slider (18–200).
+  - Mirrors all playback actions (play, pause, seek) from the main window in real time.
+  - Opening the Live View pauses playback; closing it does not change playback state.
 - **Bottom-right status**
   - Shows the current status plus a processing timer/spinner while OCR/PDF extraction is running.
 
