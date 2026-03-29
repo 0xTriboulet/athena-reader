@@ -1,6 +1,6 @@
 //! Shared model download, caching, and integrity utilities.
 //!
-//! These helpers are used by both the OCR and TTS subsystems to download,
+//! These helpers are used by the OCR subsystem (and future modules) to download,
 //! verify, and cache ONNX model files and related assets.
 
 use std::fmt;
