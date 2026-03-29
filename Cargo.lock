@@ -1510,7 +1510,7 @@ checksum = "5c4fbe202b6578d3d56428fa185cdf114a05e49da05f477b3c7f0fbb221f1862"
 [[package]]
 name = "epub-stream"
 version = "0.1.0"
-source = "git+https://github.com/h0rv/epub-stream?branch=main#6acbfe530f7b431eb783e429947d6d5848b605f1"
+source = "git+https://github.com/h0rv/epub-stream?rev=6acbfe530f7b431eb783e429947d6d5848b605f1#6acbfe530f7b431eb783e429947d6d5848b605f1"
 dependencies = [
  "crc32fast",
  "heapless",

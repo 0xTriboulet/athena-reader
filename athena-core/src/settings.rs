@@ -79,19 +79,12 @@ pub fn load_settings(path: &Path) -> Result<UserSettings, SettingsError> {
     if !path.exists() {
         return Ok(UserSettings::default());
     }
-    let contents =
-        std::fs::read_to_string(path).map_err(|error| SettingsError::Io(error.to_string()))?;
-    serde_json::from_str(&contents).map_err(|error| SettingsError::Parse(error.to_string()))
+    load_json(path)
 }
 
 /// Saves settings to the given path, creating parent directories as needed.
 pub fn save_settings(path: &Path, settings: &UserSettings) -> Result<(), SettingsError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| SettingsError::Io(error.to_string()))?;
-    }
-    let contents = serde_json::to_string_pretty(settings)
-        .map_err(|error| SettingsError::Parse(error.to_string()))?;
-    std::fs::write(path, contents).map_err(|error| SettingsError::Io(error.to_string()))
+    save_json(path, settings)
 }
 
 /// Loads the paused reading cache from disk.
@@ -101,21 +94,12 @@ pub fn load_reading_cache(path: &Path) -> Result<Option<ReadingCache>, SettingsE
     if !path.exists() {
         return Ok(None);
     }
-    let contents =
-        std::fs::read_to_string(path).map_err(|error| SettingsError::Io(error.to_string()))?;
-    let cache =
-        serde_json::from_str(&contents).map_err(|error| SettingsError::Parse(error.to_string()))?;
-    Ok(Some(cache))
+    load_json(path).map(Some)
 }
 
 /// Saves the paused reading cache to disk, creating parent directories as needed.
 pub fn save_reading_cache(path: &Path, cache: &ReadingCache) -> Result<(), SettingsError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| SettingsError::Io(error.to_string()))?;
-    }
-    let contents = serde_json::to_string_pretty(cache)
-        .map_err(|error| SettingsError::Parse(error.to_string()))?;
-    std::fs::write(path, contents).map_err(|error| SettingsError::Io(error.to_string()))
+    save_json(path, cache)
 }
 
 /// Removes the paused reading cache file when it exists.
@@ -124,6 +108,25 @@ pub fn clear_reading_cache(path: &Path) -> Result<(), SettingsError> {
         return Ok(());
     }
     std::fs::remove_file(path).map_err(|error| SettingsError::Io(error.to_string()))
+}
+
+/// Deserializes a JSON file into the requested type.
+fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, SettingsError> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|error| SettingsError::Io(error.to_string()))?;
+    serde_json::from_str(&contents).map_err(|error| SettingsError::Parse(error.to_string()))
+}
+
+/// Serializes a value as pretty-printed JSON and writes it to disk.
+///
+/// Creates parent directories as needed.
+fn save_json<T: serde::ser::Serialize>(path: &Path, data: &T) -> Result<(), SettingsError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| SettingsError::Io(error.to_string()))?;
+    }
+    let contents = serde_json::to_string_pretty(data)
+        .map_err(|error| SettingsError::Parse(error.to_string()))?;
+    std::fs::write(path, contents).map_err(|error| SettingsError::Io(error.to_string()))
 }
 
 #[cfg(test)]

@@ -8,6 +8,8 @@
 
 /// EPUB text extraction using the `epub-stream` crate.
 pub mod epub;
+/// Shared model download, caching, and integrity utilities.
+pub mod model_utils;
 /// OCR engine abstraction, model downloads, and image preprocessing helpers.
 pub mod ocr;
 /// Reading session state (current index, chunking, WPM timing).

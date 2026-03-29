@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-epub-stream = { git = "https://github.com/h0rv/epub-stream", branch = "main" }
+epub-stream = { git = "https://github.com/h0rv/epub-stream", rev = "6acbfe530f7b431eb783e429947d6d5848b605f1" }
 image = "0.25"
 oar-ocr = "0.6.1"
 sha2 = "0.10"

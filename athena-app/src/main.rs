@@ -21,7 +21,7 @@ use arboard::Clipboard;
 use athena_core::ocr::{
     DEFAULT_DETECTION_FILENAME, DEFAULT_DETECTION_URL, DEFAULT_DICT_FILENAME, DEFAULT_DICT_URL,
     DEFAULT_RECOGNITION_FILENAME, DEFAULT_RECOGNITION_URL, OarOcrEngine, OcrEngine, OcrInput,
-    OcrModelDownloadConfig, OcrModelDownloadInfo, OcrModelPaths, OcrResult, ensure_models,
+    OcrModelDownloadConfig, OcrModelDownloadInfo, OcrModelPaths, ensure_models,
 };
 use athena_core::reader::{ReadingSession, interval_ms};
 use athena_core::settings::{
@@ -400,10 +400,70 @@ impl AthenaApp {
         self.status = message.into();
     }
 
-    /// Spawns an OCR worker thread to keep the UI responsive.
-    fn spawn_ocr(&mut self, bytes: Vec<u8>) {
+    /// Returns true and sets status if processing is already running.
+    fn is_processing(&mut self) -> bool {
         if self.ui_state == UiState::Processing {
             self.set_status("Processing already running.");
+            return true;
+        }
+        false
+    }
+
+    /// Resets session-related state fields.
+    fn clear_session_state(&mut self) {
+        self.session = None;
+        self.next_tick = None;
+        self.edit_anchor = None;
+    }
+
+    /// Creates a reading session from the current `ocr_text`, optionally
+    /// placing the cursor at `start_index`.
+    fn init_session(&mut self, start_index: Option<usize>) {
+        let tokens = text::normalize_and_tokenize(&self.ocr_text);
+        if tokens.is_empty() {
+            self.clear_session_state();
+            self.clear_paused_reading_cache();
+            self.set_error("No readable tokens found in text.");
+            return;
+        }
+        let mut session = ReadingSession::new(self.ocr_text.clone(), tokens, self.settings.wpm);
+        session.set_chunk_size(self.settings.chunk_size);
+        session.set_playing(false);
+        if let Some(idx) = start_index {
+            session.current_index = idx.min(session.tokens.len().saturating_sub(1));
+        }
+        self.session = Some(session);
+        self.next_tick = None;
+        self.edit_anchor = None;
+        self.set_state(UiState::Reading, "Ready.");
+        self.persist_paused_reading_cache();
+    }
+
+    /// Spawns a background worker that sends its result as an [`OcrResponse`].
+    fn spawn_text_worker<F>(&mut self, status: &str, work: F)
+    where
+        F: FnOnce() -> Result<String, String> + Send + 'static,
+    {
+        if self.is_processing() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.ocr_rx = Some(rx);
+        self.ocr_started_at = Some(Instant::now());
+        self.set_state(UiState::Processing, status);
+
+        thread::spawn(move || {
+            let message = match work() {
+                Ok(text) => OcrResponse::Success(text),
+                Err(error) => OcrResponse::Error(error),
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    /// Spawns an OCR worker thread to keep the UI responsive.
+    fn spawn_ocr(&mut self, bytes: Vec<u8>) {
+        if self.is_processing() {
             return;
         }
 
@@ -414,7 +474,6 @@ impl AthenaApp {
             return;
         };
 
-        let (tx, rx) = mpsc::channel();
         let paths = OcrModelPaths::new(
             paths.detection.clone(),
             paths.recognition.clone(),
@@ -429,24 +488,17 @@ impl AthenaApp {
       );
             return;
         }
-        self.ocr_rx = Some(rx);
-        self.ocr_started_at = Some(Instant::now());
         let status = if missing_models {
             "Downloading OCR models..."
         } else {
             "Running OCR..."
         };
-        self.set_state(UiState::Processing, status);
-
-        thread::spawn(move || {
-            let result = ensure_models(&paths, &download_config)
+        self.spawn_text_worker(status, move || {
+            ensure_models(&paths, &download_config)
                 .and_then(|_| OarOcrEngine::from_paths(&paths))
-                .and_then(|mut engine| engine.extract_text(&OcrInput::Bytes(bytes)));
-            let message = match result {
-                Ok(OcrResult { text, .. }) => OcrResponse::Success(text),
-                Err(error) => OcrResponse::Error(error.to_string()),
-            };
-            let _ = tx.send(message);
+                .and_then(|mut engine| engine.extract_text(&OcrInput::Bytes(bytes)))
+                .map(|result| result.text)
+                .map_err(|error| error.to_string())
         });
     }
 
@@ -501,8 +553,7 @@ impl AthenaApp {
 
     /// Reads text or an image from the clipboard and starts reading/OCR.
     fn paste_from_clipboard(&mut self) {
-        if self.ui_state == UiState::Processing {
-            self.set_status("Processing already running.");
+        if self.is_processing() {
             return;
         }
 
@@ -517,8 +568,7 @@ impl AthenaApp {
         if let Ok(text) = clipboard.get_text() {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                self.session = None;
-                self.next_tick = None;
+                self.clear_session_state();
                 self.ocr_text = trimmed.to_string();
                 self.set_state(UiState::Preview, "Text ready.");
                 self.start_session();
@@ -555,8 +605,7 @@ impl AthenaApp {
             return;
         }
 
-        self.session = None;
-        self.next_tick = None;
+        self.clear_session_state();
         self.ocr_text.clear();
         self.spawn_ocr(png_bytes);
     }
@@ -581,8 +630,7 @@ impl AthenaApp {
                         is_txt,
                         is_epub,
                     } => {
-                        self.session = None;
-                        self.next_tick = None;
+                        self.clear_session_state();
                         self.ocr_text.clear();
                         if is_txt {
                             self.ocr_text = String::from_utf8_lossy(&bytes).trim().to_string();
@@ -612,54 +660,23 @@ impl AthenaApp {
 
     /// Spawns a background worker to extract embedded text from a PDF file.
     fn spawn_pdf_text_extract(&mut self, bytes: Vec<u8>) {
-        if self.ui_state == UiState::Processing {
-            self.set_status("Processing already running.");
-            return;
-        }
-
-        let (tx, rx) = mpsc::channel();
-        self.ocr_rx = Some(rx);
-        self.ocr_started_at = Some(Instant::now());
-        self.set_state(UiState::Processing, "Extracting PDF text...");
-
-        thread::spawn(move || {
-            let result = pdf_extract::extract_text_from_mem(&bytes)
+        self.spawn_text_worker("Extracting PDF text...", move || {
+            pdf_extract::extract_text_from_mem(&bytes)
+                .map(|text| text.trim().to_string())
                 .map_err(|error| error.to_string())
-                .map(|text| text.trim().to_string());
-            let message = match result {
-                Ok(text) => OcrResponse::Success(text),
-                Err(error) => OcrResponse::Error(error),
-            };
-            let _ = tx.send(message);
         });
     }
 
     /// Spawns a background worker to extract plain text from an EPUB file.
     fn spawn_epub_text_extract(&mut self, bytes: Vec<u8>) {
-        if self.ui_state == UiState::Processing {
-            self.set_status("Processing already running.");
-            return;
-        }
-
-        let (tx, rx) = mpsc::channel();
-        self.ocr_rx = Some(rx);
-        self.ocr_started_at = Some(Instant::now());
-        self.set_state(UiState::Processing, "Extracting EPUB text...");
-
-        thread::spawn(move || {
-            let result = athena_core::epub::extract_text_from_bytes(&bytes);
-            let message = match result {
-                Ok(text) => OcrResponse::Success(text),
-                Err(error) => OcrResponse::Error(error),
-            };
-            let _ = tx.send(message);
+        self.spawn_text_worker("Extracting EPUB text...", move || {
+            athena_core::epub::extract_text_from_bytes(&bytes)
         });
     }
 
     /// Opens an OS file picker (non-blocking) and starts OCR or PDF extraction based on selection.
     fn import_image_from_file(&mut self) {
-        if self.ui_state == UiState::Processing || self.import_rx.is_some() {
-            self.set_status("Processing already running.");
+        if self.is_processing() || self.import_rx.is_some() {
             return;
         }
 
@@ -683,21 +700,9 @@ impl AthenaApp {
             let message = match picked {
                 None => ImportResponse::Canceled,
                 Some(file) => {
-                    let is_pdf = file
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
-                    let is_txt = file
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"));
-                    let is_epub = file
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"));
+                    let is_pdf = has_extension(file.path(), "pdf");
+                    let is_txt = has_extension(file.path(), "txt");
+                    let is_epub = has_extension(file.path(), "epub");
                     let bytes = pollster::block_on(file.read());
                     ImportResponse::Selected {
                         bytes,
@@ -763,23 +768,7 @@ impl AthenaApp {
     }
 
     fn start_session(&mut self) {
-        let tokens = text::normalize_and_tokenize(&self.ocr_text);
-        if tokens.is_empty() {
-            self.session = None;
-            self.next_tick = None;
-            self.edit_anchor = None;
-            self.clear_paused_reading_cache();
-            self.set_error("No readable tokens found in text.");
-            return;
-        }
-        let mut session = ReadingSession::new(self.ocr_text.clone(), tokens, self.settings.wpm);
-        session.set_chunk_size(self.settings.chunk_size);
-        session.set_playing(false);
-        self.session = Some(session);
-        self.next_tick = None;
-        self.edit_anchor = None;
-        self.set_state(UiState::Reading, "Ready.");
-        self.persist_paused_reading_cache();
+        self.init_session(None);
     }
 
     fn open_editor_from_preview(&mut self) {
@@ -804,9 +793,7 @@ impl AthenaApp {
         self.ocr_text = self.ocr_editor_draft.trim().to_string();
         let tokens = text::normalize_and_tokenize(&self.ocr_text);
         if tokens.is_empty() {
-            self.session = None;
-            self.next_tick = None;
-            self.edit_anchor = None;
+            self.clear_session_state();
             self.clear_paused_reading_cache();
             self.set_error("No readable tokens found in text.");
             return;
@@ -818,16 +805,7 @@ impl AthenaApp {
             .map(|anchor| remap_index_after_edit(anchor, &tokens))
             .unwrap_or(0);
 
-        let mut session = ReadingSession::new(self.ocr_text.clone(), tokens, self.settings.wpm);
-        session.set_chunk_size(self.settings.chunk_size);
-        session.set_playing(false);
-        session.current_index = mapped_index.min(session.tokens.len().saturating_sub(1));
-
-        self.session = Some(session);
-        self.next_tick = None;
-        self.edit_anchor = None;
-        self.set_state(UiState::Reading, "Ready.");
-        self.persist_paused_reading_cache();
+        self.init_session(Some(mapped_index));
     }
 
     fn play(&mut self) {
@@ -1539,11 +1517,16 @@ fn reading_cache_path() -> Option<PathBuf> {
         .map(|dirs| dirs.config_dir().join("reading_cache.json"))
 }
 
+/// Checks whether a path has the given file extension (case-insensitive).
+fn has_extension(path: &std::path::Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
 /// Returns the cache directory used for OCR model storage.
 fn model_cache_dir() -> Option<PathBuf> {
-    if let Ok(path) = env::var(ENV_OCR_CACHE_DIR)
-        && !path.trim().is_empty()
-    {
+    if let Some(path) = env_var_nonempty(ENV_OCR_CACHE_DIR) {
         return Some(PathBuf::from(path));
     }
     ProjectDirs::from("com", "athena", "reader").map(|dirs| dirs.cache_dir().join("ocrs"))
@@ -1559,6 +1542,11 @@ fn env_var_truthy(name: &str) -> bool {
     })
 }
 
+/// Returns the value of an environment variable if set and non-empty.
+fn env_var_nonempty(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
 /// Builds the OCR model download configuration using environment overrides.
 fn model_download_config() -> OcrModelDownloadConfig {
     let detection_url =
@@ -1566,15 +1554,9 @@ fn model_download_config() -> OcrModelDownloadConfig {
     let recognition_url =
         env::var(ENV_OCR_RECOGNITION_URL).unwrap_or_else(|_| DEFAULT_RECOGNITION_URL.into());
     let dict_url = env::var(ENV_OCR_DICT_URL).unwrap_or_else(|_| DEFAULT_DICT_URL.into());
-    let detection_sha256 = env::var(ENV_OCR_DETECTION_SHA256)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let recognition_sha256 = env::var(ENV_OCR_RECOGNITION_SHA256)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let dict_sha256 = env::var(ENV_OCR_DICT_SHA256)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let detection_sha256 = env_var_nonempty(ENV_OCR_DETECTION_SHA256);
+    let recognition_sha256 = env_var_nonempty(ENV_OCR_RECOGNITION_SHA256);
+    let dict_sha256 = env_var_nonempty(ENV_OCR_DICT_SHA256);
     let allow_download = !env_var_truthy(ENV_OCR_DISABLE_DOWNLOAD);
 
     OcrModelDownloadConfig::new(
@@ -1587,18 +1569,9 @@ fn model_download_config() -> OcrModelDownloadConfig {
 
 /// Resolves OCR model file paths from environment overrides and cache defaults.
 fn default_model_paths() -> Option<OcrModelPaths> {
-    let detection_env = env::var(ENV_OCR_DETECTION_MODEL)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from);
-    let recognition_env = env::var(ENV_OCR_RECOGNITION_MODEL)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from);
-    let dict_env = env::var(ENV_OCR_DICT_PATH)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from);
+    let detection_env = env_var_nonempty(ENV_OCR_DETECTION_MODEL).map(PathBuf::from);
+    let recognition_env = env_var_nonempty(ENV_OCR_RECOGNITION_MODEL).map(PathBuf::from);
+    let dict_env = env_var_nonempty(ENV_OCR_DICT_PATH).map(PathBuf::from);
     let cache_dir = model_cache_dir();
 
     let detection = detection_env.or_else(|| {

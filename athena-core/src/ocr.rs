@@ -6,13 +6,11 @@
 //! - An [`OcrEngine`] trait implemented by the default `oar-ocr` backend
 
 use std::fmt;
-use std::fs;
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use oar_ocr::oarocr::{OAROCR, OAROCRBuilder};
-use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
+
+use crate::model_utils::{self, ModelDownloadInfo, ModelError};
 
 /// Errors returned by OCR preprocessing, configuration, model download, or engine execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,22 +127,8 @@ pub const DEFAULT_RECOGNITION_URL: &str =
 pub const DEFAULT_DICT_URL: &str =
     "https://huggingface.co/GetcharZp/go-ocr/resolve/main/paddle_weights/dict.txt?download=true";
 
-/// Describes a single OCR model download source and optional integrity hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OcrModelDownloadInfo {
-    pub url: String,
-    pub sha256: Option<String>,
-}
-
-impl OcrModelDownloadInfo {
-    /// Creates a download descriptor for a model file.
-    pub fn new(url: impl Into<String>, sha256: Option<String>) -> Self {
-        Self {
-            url: url.into(),
-            sha256,
-        }
-    }
-}
+/// Re-export of the shared model download descriptor.
+pub type OcrModelDownloadInfo = ModelDownloadInfo;
 
 /// Configures download behavior for the OCR detection and recognition models.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,118 +213,27 @@ pub fn ensure_models(
     paths: &OcrModelPaths,
     config: &OcrModelDownloadConfig,
 ) -> Result<OcrModelAvailability, OcrError> {
+    let map_err = |e: ModelError| match e {
+        ModelError::NotConfigured(msg) => OcrError::NotConfigured(msg),
+        ModelError::Failure(msg) => OcrError::EngineFailure(msg),
+    };
     let downloaded_detection =
-        ensure_model_file(&paths.detection, &config.detection, config.allow_download)?;
-    let downloaded_recognition = ensure_model_file(
+        model_utils::ensure_model_file(&paths.detection, &config.detection, config.allow_download)
+            .map_err(map_err)?;
+    let downloaded_recognition = model_utils::ensure_model_file(
         &paths.recognition,
         &config.recognition,
         config.allow_download,
-    )?;
-    let downloaded_dict = ensure_model_file(&paths.dict, &config.dict, config.allow_download)?;
+    )
+    .map_err(map_err)?;
+    let downloaded_dict =
+        model_utils::ensure_model_file(&paths.dict, &config.dict, config.allow_download)
+            .map_err(map_err)?;
     Ok(OcrModelAvailability {
         downloaded_detection,
         downloaded_recognition,
         downloaded_dict,
     })
-}
-
-/// Ensures a single model file exists and passes integrity checks.
-fn ensure_model_file(
-    path: &Path,
-    info: &OcrModelDownloadInfo,
-    allow_download: bool,
-) -> Result<bool, OcrError> {
-    if path.exists() {
-        if let Some(expected) = normalize_hash(info.sha256.as_deref()) {
-            if verify_sha256(path, &expected)? {
-                return Ok(false);
-            }
-            if !allow_download {
-                return Err(OcrError::NotConfigured(format!(
-                    "Model at {} failed integrity check and downloads are disabled.",
-                    path.display()
-                )));
-            }
-            let _ = fs::remove_file(path);
-        } else {
-            return Ok(false);
-        }
-    }
-
-    if !allow_download {
-        return Err(OcrError::NotConfigured(format!(
-            "Model missing at {} and downloads are disabled.",
-            path.display()
-        )));
-    }
-
-    download_to_path(&info.url, path)?;
-    if let Some(expected) = normalize_hash(info.sha256.as_deref())
-        && !verify_sha256(path, &expected)?
-    {
-        let _ = fs::remove_file(path);
-        return Err(OcrError::EngineFailure(format!(
-            "Downloaded model failed integrity check at {}.",
-            path.display()
-        )));
-    }
-    Ok(true)
-}
-
-/// Downloads a model file to the given path using a temporary file.
-fn download_to_path(url: &str, path: &Path) -> Result<(), OcrError> {
-    let parent = path.parent().ok_or_else(|| {
-        OcrError::EngineFailure(format!(
-            "Model path {} has no parent directory.",
-            path.display()
-        ))
-    })?;
-    fs::create_dir_all(parent).map_err(|error| OcrError::EngineFailure(error.to_string()))?;
-
-    let response = ureq::get(url)
-        .call()
-        .map_err(|error| OcrError::EngineFailure(error.to_string()))?;
-    let mut reader = response.into_reader();
-    let mut temp_file = NamedTempFile::new_in(parent)
-        .map_err(|error| OcrError::EngineFailure(error.to_string()))?;
-    io::copy(&mut reader, &mut temp_file)
-        .map_err(|error| OcrError::EngineFailure(error.to_string()))?;
-    temp_file
-        .persist(path)
-        .map_err(|error| OcrError::EngineFailure(error.to_string()))?;
-    Ok(())
-}
-
-/// Computes the lowercase hex SHA-256 checksum of a file.
-fn sha256_file(path: &Path) -> Result<String, OcrError> {
-    let mut file =
-        fs::File::open(path).map_err(|error| OcrError::EngineFailure(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| OcrError::EngineFailure(error.to_string()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// Verifies the SHA-256 checksum for a model file.
-fn verify_sha256(path: &Path, expected: &str) -> Result<bool, OcrError> {
-    let actual = sha256_file(path)?;
-    Ok(actual.eq_ignore_ascii_case(expected))
-}
-
-/// Normalizes an optional hash string by trimming and lowercasing.
-fn normalize_hash(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_lowercase())
 }
 
 impl OcrEngine for OarOcrEngine {
@@ -374,8 +267,8 @@ impl OcrEngine for OarOcrEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_utils;
     use image::{DynamicImage, ImageBuffer, Rgb};
-    use std::fs;
 
     #[test]
     fn preprocess_image_bytes_decodes_rgb_pixels() {
@@ -442,8 +335,8 @@ mod tests {
     fn sha256_file_verifies_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sample.bin");
-        fs::write(&path, b"athena").unwrap();
-        let hash = sha256_file(&path).unwrap();
-        assert!(verify_sha256(&path, &hash).unwrap());
+        std::fs::write(&path, b"athena").unwrap();
+        let hash = model_utils::sha256_file(&path).unwrap();
+        assert!(model_utils::verify_sha256(&path, &hash).unwrap());
     }
 }
